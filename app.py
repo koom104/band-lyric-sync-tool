@@ -15,6 +15,7 @@ import urllib.request
 import wave
 from dataclasses import dataclass
 from difflib import SequenceMatcher
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable
 
@@ -74,6 +75,43 @@ def run(cmd: list[str], cwd: Path | None = None) -> None:
         raise RuntimeError(f"Command failed:\n{' '.join(cmd)}\n\n{proc.stdout[-4000:]}")
 
 
+def run_output(cmd: list[str], cwd: Path | None = None) -> str:
+    env = os.environ.copy()
+    env.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+    proc = subprocess.run(
+        cmd,
+        cwd=cwd,
+        env=env,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"Command failed:\n{' '.join(cmd)}\n\n{proc.stderr[-4000:]}")
+    return proc.stdout
+
+
+@lru_cache(maxsize=1)
+def torch_cuda_available() -> bool:
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+@lru_cache(maxsize=None)
+def ffmpeg_has_encoder(encoder: str) -> bool:
+    try:
+        output = run_output(["ffmpeg", "-hide_banner", "-encoders"])
+    except Exception:
+        return False
+    return encoder in output
+
+
 def ffprobe_duration(media: Path) -> float:
     cmd = [
         "ffprobe",
@@ -122,7 +160,76 @@ def download_youtube_reference(url: str, work_dir: Path) -> Path:
     return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
-def prepare_reference_audio(reference_file: object, reference_youtube_url: str, work_dir: Path) -> tuple[Path, str]:
+def _youtube_search_reference(
+    artist: str,
+    song_title: str,
+    target_duration: float,
+    work_dir: Path,
+) -> tuple[Path | None, str]:
+    query = f"{artist.strip()} {song_title.strip()} official audio".strip()
+    if not query:
+        return None, "YouTube automatic search skipped: artist/title missing"
+    try:
+        raw = run_output([
+            os.sys.executable,
+            "-m",
+            "yt_dlp",
+            "--dump-single-json",
+            "--flat-playlist",
+            "--no-warnings",
+            f"ytsearch8:{query}",
+        ])
+        payload = json.loads(raw)
+    except Exception as exc:
+        return None, f"YouTube automatic search failed: {exc}"
+
+    title_key = normalize_for_lyric_match(song_title)
+    artist_key = normalize_for_lyric_match(artist)
+    ranked: list[tuple[float, dict]] = []
+    for entry in payload.get("entries", []):
+        duration = float(entry.get("duration") or 0)
+        video_id = entry.get("id")
+        if not video_id or duration <= 0:
+            continue
+        candidate_title = str(entry.get("title") or "")
+        channel = str(entry.get("channel") or entry.get("uploader") or "")
+        candidate_key = normalize_for_lyric_match(f"{candidate_title} {channel}")
+        duration_error = abs(duration - target_duration) / max(1.0, target_duration)
+        score = duration_error
+        if title_key and title_key not in candidate_key:
+            score += 0.35
+        if artist_key and artist_key not in candidate_key:
+            score += 0.20
+        lowered = f"{candidate_title} {channel}".lower()
+        if "official audio" in lowered or "topic" in lowered:
+            score -= 0.05
+        ranked.append((score, entry))
+    if not ranked:
+        return None, "YouTube automatic search returned no usable audio"
+
+    _score, selected = min(ranked, key=lambda pair: pair[0])
+    selected_duration = float(selected.get("duration") or 0)
+    duration_error = abs(selected_duration - target_duration) / max(1.0, target_duration)
+    if duration_error > 0.18:
+        return None, (
+            f"YouTube automatic search found no duration-compatible audio "
+            f"(closest {selected_duration:.1f}s, performance {target_duration:.1f}s)"
+        )
+    selected_url = f"https://www.youtube.com/watch?v={selected['id']}"
+    source = download_youtube_reference(selected_url, work_dir)
+    title = selected.get("title") or song_title
+    channel = selected.get("channel") or selected.get("uploader") or "unknown channel"
+    return source, f"auto-selected YouTube: {channel} - {title} ({selected_duration:.1f}s)"
+
+
+def prepare_reference_audio(
+    reference_file: object,
+    reference_youtube_url: str,
+    artist: str,
+    song_title: str,
+    target_duration: float,
+    work_dir: Path,
+) -> tuple[Path, str]:
     reference_path = resolve_uploaded_path(reference_file)
     source_note = ""
     if reference_path and reference_path.exists():
@@ -131,6 +238,26 @@ def prepare_reference_audio(reference_file: object, reference_youtube_url: str, 
     elif reference_youtube_url and reference_youtube_url.strip():
         source = download_youtube_reference(reference_youtube_url, work_dir / "youtube_reference")
         source_note = "reference YouTube URL"
+        source_duration = ffprobe_duration(source)
+        duration_error = abs(source_duration - target_duration) / max(1.0, target_duration)
+        if duration_error > 0.15:
+            replacement, search_note = _youtube_search_reference(
+                artist,
+                song_title,
+                target_duration,
+                work_dir / "youtube_reference_auto",
+            )
+            if replacement is not None:
+                source = replacement
+                source_note = (
+                    f"provided YouTube duration mismatch {source_duration:.1f}s vs {target_duration:.1f}s; "
+                    f"{search_note}"
+                )
+            else:
+                raise gr.Error(
+                    f"레퍼런스가 {source_duration:.1f}초, 공연이 {target_duration:.1f}초로 길이가 너무 다릅니다. "
+                    f"{search_note}"
+                )
     else:
         raise gr.Error("Reference audio DTW 모드에서는 reference audio file 또는 reference YouTube URL이 필요합니다.")
     reference_wav = work_dir / "reference_22050.wav"
@@ -140,6 +267,7 @@ def prepare_reference_audio(reference_file: object, reference_youtube_url: str, 
 
 def separate_vocals(audio: Path, work_dir: Path) -> Path:
     out_dir = work_dir / "demucs"
+    device = "cuda" if torch_cuda_available() else "cpu"
     run([
         os.sys.executable,
         "-m",
@@ -150,6 +278,8 @@ def separate_vocals(audio: Path, work_dir: Path) -> Path:
         "htdemucs",
         "-o",
         str(out_dir),
+        "-d",
+        device,
         str(audio),
     ])
     candidates = list(out_dir.glob("**/vocals.wav"))
@@ -603,6 +733,14 @@ def build_dtw_time_map(reference_audio: Path, performance_audio: Path, work_dir:
     y_perf, _ = librosa.load(str(performance_audio), sr=sample_rate, mono=True)
     if y_ref.size < sample_rate or y_perf.size < sample_rate:
         raise gr.Error("Reference audio DTW failed: audio is too short.")
+    reference_duration = y_ref.size / sample_rate
+    performance_duration = y_perf.size / sample_rate
+    duration_ratio = max(reference_duration, performance_duration) / min(reference_duration, performance_duration)
+    if duration_ratio > 1.18:
+        raise gr.Error(
+            f"레퍼런스({reference_duration:.1f}초)와 공연({performance_duration:.1f}초)의 길이 차이가 너무 커서 "
+            "안전하게 정렬할 수 없습니다. 잘못된 시작점 생성을 중단했습니다."
+        )
 
     ref_chroma = librosa.feature.chroma_cens(y=y_ref, sr=sample_rate, hop_length=hop_length)
     perf_chroma = librosa.feature.chroma_cens(y=y_perf, sr=sample_rate, hop_length=hop_length)
@@ -643,6 +781,13 @@ def build_dtw_time_map(reference_audio: Path, performance_audio: Path, work_dir:
     perf_axis = np.maximum.accumulate(np.asarray(mapped_perf, dtype=np.float64))
     offsets = perf_axis - ref_axis
     offset_low, offset_mid, offset_high = np.percentile(offsets, [5, 50, 95])
+    offset_spread = offset_high - offset_low
+    max_stable_spread = max(12.0, min(reference_duration, performance_duration) * 0.10)
+    if offset_spread > max_stable_spread:
+        raise gr.Error(
+            f"DTW 시간축 변동이 {offset_spread:.1f}초로 너무 큽니다. "
+            "반복 구간을 잘못 연결할 가능성이 있어 결과 생성을 중단했습니다."
+        )
     status = (
         f"DTW path frames {len(path)}, reference {ref_axis[-1]:.2f}s, "
         f"performance {perf_axis[-1]:.2f}s, offset median {offset_mid:+.2f}s "
@@ -841,20 +986,113 @@ def _compress_lrc_items_for_blocks(blocks: list[LyricBlock], items: list[TimedLy
     return compressed
 
 
+def _match_blocks_and_lrc_groups(
+    blocks: list[LyricBlock],
+    items: list[TimedLyric],
+) -> tuple[list[TimedLyric] | None, float]:
+    """Match skipped LRC rows and split/combined lyric rows using text similarity."""
+    n = len(blocks)
+    m = len(items)
+    negative = -1e9
+    dp = [[negative] * (m + 1) for _ in range(n + 1)]
+    back: list[list[tuple[int, int, str, int, int, float] | None]] = [
+        [None] * (m + 1) for _ in range(n + 1)
+    ]
+    dp[0][0] = 0.0
+
+    for block_idx in range(n + 1):
+        for item_idx in range(m + 1):
+            current = dp[block_idx][item_idx]
+            if current <= negative / 2:
+                continue
+            if item_idx < m and current - 0.12 > dp[block_idx][item_idx + 1]:
+                dp[block_idx][item_idx + 1] = current - 0.12
+                back[block_idx][item_idx + 1] = (block_idx, item_idx, "skip", 0, 1, 0.0)
+
+            for block_count in range(1, min(3, n - block_idx) + 1):
+                for item_count in range(1, min(3, m - item_idx) + 1):
+                    if block_count > 1 and item_count > 1:
+                        continue
+                    block_text = " ".join(
+                        block.sync_text for block in blocks[block_idx : block_idx + block_count]
+                    )
+                    item_text = " ".join(item.text for item in items[item_idx : item_idx + item_count])
+                    score = similarity(block_text, item_text)
+                    candidate = current + score - 0.04 * (block_count + item_count - 2)
+                    next_block = block_idx + block_count
+                    next_item = item_idx + item_count
+                    if candidate > dp[next_block][next_item]:
+                        dp[next_block][next_item] = candidate
+                        back[next_block][next_item] = (
+                            block_idx,
+                            item_idx,
+                            "align",
+                            block_count,
+                            item_count,
+                            score,
+                        )
+
+    block_idx, item_idx = n, m
+    groups: list[tuple[int, int, int, int, float]] = []
+    while block_idx or item_idx:
+        previous = back[block_idx][item_idx]
+        if previous is None:
+            return None, 0.0
+        prev_block, prev_item, kind, _block_count, _item_count, score = previous
+        if kind == "align":
+            groups.append((prev_block, block_idx, prev_item, item_idx, score))
+        block_idx, item_idx = prev_block, prev_item
+    groups.reverse()
+
+    average_score = sum(group[4] for group in groups) / max(1, len(groups))
+    if average_score < 0.22:
+        return None, average_score
+
+    timing_items: list[TimedLyric] = []
+    for block_start, block_end, item_start, item_end, _score in groups:
+        grouped_items = items[item_start:item_end]
+        grouped_blocks = blocks[block_start:block_end]
+        start = grouped_items[0].start
+        end = grouped_items[-1].end
+        if len(grouped_blocks) == 1:
+            timing_items.append(
+                TimedLyric(start, end, " ".join(item.text for item in grouped_items))
+            )
+            continue
+
+        weights = np.sqrt(
+            np.asarray(
+                [max(1, len(normalize_for_lyric_match(block.sync_text))) for block in grouped_blocks],
+                dtype=float,
+            )
+        )
+        weights /= max(1e-9, float(weights.sum()))
+        boundaries = [start]
+        for fraction in np.cumsum(weights)[:-1]:
+            boundaries.append(start + (end - start) * float(fraction))
+        boundaries.append(end)
+        item_text = " ".join(item.text for item in grouped_items)
+        for part_idx in range(len(grouped_blocks)):
+            timing_items.append(TimedLyric(boundaries[part_idx], boundaries[part_idx + 1], item_text))
+    return timing_items, average_score
+
+
 def align_blocks_to_lrc(blocks: list[LyricBlock], lrc_text: str, duration: float) -> tuple[list[CaptionLine], float, int]:
     lrc_items = parse_lrc_items(lrc_text, duration)
     if not blocks or not lrc_items:
         return [], 0.0, 0
 
-    timing_items = _expand_lrc_items_for_blocks(blocks, lrc_items)
-    timing_items = _compress_lrc_items_for_blocks(blocks, timing_items)
+    timing_items, structural_score = _match_blocks_and_lrc_groups(blocks, lrc_items)
+    if timing_items is None:
+        timing_items = _expand_lrc_items_for_blocks(blocks, lrc_items)
+        timing_items = _compress_lrc_items_for_blocks(blocks, timing_items)
     captions: list[CaptionLine] = []
     scores: list[float] = []
     for block, item in zip(blocks, timing_items):
         score = similarity(block.sync_text, item.text)
         scores.append(score)
         captions.append(CaptionLine(item.start, min(duration, item.end), block.text, score))
-    avg_score = sum(scores) / max(1, len(scores))
+    avg_score = structural_score if structural_score >= 0.22 else sum(scores) / max(1, len(scores))
     return captions, avg_score, len(lrc_items)
 
 
@@ -943,8 +1181,36 @@ def filter_escape_path(path: Path) -> str:
     return value
 
 
-def burn_subtitles(video: Path, ass_path: Path, output_path: Path) -> None:
+def burn_subtitles(video: Path, ass_path: Path, output_path: Path) -> str:
     subtitle_filter = f"subtitles='{filter_escape_path(ass_path)}'"
+    if ffmpeg_has_encoder("h264_nvenc"):
+        try:
+            run([
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(video),
+                "-vf",
+                subtitle_filter,
+                "-c:v",
+                "h264_nvenc",
+                "-preset",
+                "p5",
+                "-tune",
+                "hq",
+                "-rc",
+                "vbr",
+                "-cq",
+                "20",
+                "-b:v",
+                "0",
+                "-c:a",
+                "copy",
+                str(output_path),
+            ])
+            return "h264_nvenc GPU"
+        except Exception:
+            pass
     run([
         "ffmpeg",
         "-y",
@@ -962,6 +1228,7 @@ def burn_subtitles(video: Path, ass_path: Path, output_path: Path) -> None:
         "copy",
         str(output_path),
     ])
+    return "libx264 CPU fallback"
 
 
 def safe_slug(text: str) -> str:
@@ -1109,7 +1376,14 @@ def _create_subtitles_impl(
         segments: list[WhisperSegment] = []
         lrc_status = ""
         if alignment_mode == "Reference audio DTW":
-            reference_audio, reference_note = prepare_reference_audio(reference_file, reference_youtube_url, job)
+            reference_audio, reference_note = prepare_reference_audio(
+                reference_file,
+                reference_youtube_url,
+                artist,
+                song_title,
+                duration,
+                job,
+            )
             reference_duration = ffprobe_duration(reference_audio)
             lrc_text, lrc_status = fetch_lrclib_synced_lyrics(artist, song_title, reference_duration, len(lyric_blocks))
             if not lrc_text:
@@ -1216,7 +1490,8 @@ def _create_subtitles_impl(
 
     video_output = None
     if burn_video:
-        burn_subtitles(video, ass_path, mp4_path)
+        encoder_note = burn_subtitles(video, ass_path, mp4_path)
+        status += f" / video encoder: {encoder_note}"
         video_output = str(mp4_path)
 
     preview = "\n".join(

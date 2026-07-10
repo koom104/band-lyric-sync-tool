@@ -3,8 +3,9 @@ faster-whisper==1.2.1
 demucs==4.0.1
 numpy<2
 soundfile==0.12.1
-torch==2.3.1
-torchaudio==2.3.1
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.3.1+cu121
+torchaudio==2.3.1+cu121
 librosa==0.10.2.post1
 scipy==1.13.1
 yt-dlp>=2025.12.8

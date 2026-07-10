@@ -30,6 +30,29 @@ class AlignmentTests(unittest.TestCase):
         self.assertLess(captions[1].start, captions[2].start)
         self.assertLessEqual(captions[1].end, captions[2].start)
 
+    def test_text_matching_handles_skipped_and_split_lrc_rows(self):
+        blocks = [
+            app.LyricBlock("first", "first"),
+            app.LyricBlock("second", "second"),
+            app.LyricBlock("part one", "part one"),
+            app.LyricBlock("part two", "part two"),
+        ]
+        lrc = (
+            "[00:01.00] first\n"
+            "[00:03.00] omitted parenthetical\n"
+            "[00:05.00] second\n"
+            "[00:07.00] part one part two\n"
+            "[00:11.00] "
+        )
+
+        captions, score, _lrc_count = app.align_blocks_to_lrc(blocks, lrc, 12.0)
+
+        self.assertGreater(score, 0.8)
+        self.assertEqual(len(captions), 4)
+        self.assertAlmostEqual(captions[1].start, 5.0)
+        self.assertAlmostEqual(captions[2].start, 7.0)
+        self.assertLess(captions[2].start, captions[3].start)
+
 
 if __name__ == "__main__":
     unittest.main()
