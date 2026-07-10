@@ -53,6 +53,18 @@ class AlignmentTests(unittest.TestCase):
         self.assertAlmostEqual(captions[2].start, 7.0)
         self.assertLess(captions[2].start, captions[3].start)
 
+    def test_full_song_duplicate_is_removed_without_touching_chorus_repeats(self):
+        song = "\n".join(f"line {index} unique lyric content" for index in range(30))
+        cleaned, removed = app.remove_duplicate_full_lyrics(song + song)
+
+        self.assertTrue(removed)
+        self.assertEqual(cleaned, song)
+
+        chorus_song = song + "\nline 1 unique lyric content\nline 2 unique lyric content"
+        unchanged, removed = app.remove_duplicate_full_lyrics(chorus_song)
+        self.assertFalse(removed)
+        self.assertEqual(unchanged, chorus_song)
+
 
 if __name__ == "__main__":
     unittest.main()

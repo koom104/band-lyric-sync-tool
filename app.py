@@ -454,6 +454,36 @@ def similarity(left: str, right: str) -> float:
     return SequenceMatcher(None, left_norm, right_norm).ratio()
 
 
+def remove_duplicate_full_lyrics(lyrics: str) -> tuple[str, bool]:
+    """Remove an accidentally pasted second full-song copy, preserving the first."""
+    allowed = re.compile(r"[0-9a-z\u3040-\u30ff\u3400-\u9fff\uac00-\ud7a3]")
+    normalized_chars: list[str] = []
+    source_positions: list[int] = []
+    for source_idx, char in enumerate(lyrics.lower()):
+        if allowed.fullmatch(char):
+            normalized_chars.append(char)
+            source_positions.append(source_idx)
+    normalized = "".join(normalized_chars)
+    if len(normalized) < 240:
+        return lyrics, False
+
+    prefix_length = min(300, max(100, len(normalized) // 5))
+    prefix = normalized[:prefix_length]
+    search_start = int(len(normalized) * 0.40)
+    search_end = int(len(normalized) * 0.60)
+    candidate = normalized.find(prefix, search_start, search_end + prefix_length)
+    while candidate != -1 and candidate <= search_end:
+        first_copy = normalized[:candidate]
+        second_copy = normalized[candidate:]
+        length_ratio = min(len(first_copy), len(second_copy)) / max(len(first_copy), len(second_copy))
+        duplicate_score = SequenceMatcher(None, first_copy, second_copy).ratio()
+        if length_ratio >= 0.92 and duplicate_score >= 0.97:
+            cutoff = source_positions[candidate]
+            return lyrics[:cutoff].rstrip(), True
+        candidate = normalized.find(prefix, candidate + 1, search_end + prefix_length)
+    return lyrics, False
+
+
 def transcribe(audio: Path, model_size: str, language: str) -> list[WhisperSegment]:
     from faster_whisper import WhisperModel
 
@@ -1367,7 +1397,8 @@ def _create_subtitles_impl(
         captions = lrc_lines
         status = f"LRC 타임스탬프 {len(captions)}줄을 사용했습니다."
     else:
-        lyric_blocks = split_lyric_blocks(lyrics, lyric_grouping, sync_source)
+        deduplicated_lyrics, duplicate_removed = remove_duplicate_full_lyrics(lyrics)
+        lyric_blocks = split_lyric_blocks(deduplicated_lyrics, lyric_grouping, sync_source)
         audio = job / "audio.wav"
         extract_audio(video, audio)
         align_audio = audio
@@ -1451,7 +1482,8 @@ def _create_subtitles_impl(
         warning = ""
         if alignment_mode == "Whisper fuzzy match" and (len(segments) < 3 or avg_score < 0.12):
             warning = " / 경고: Whisper 매칭 품질이 낮습니다. 일본어 곡이면 Language=ja, Sync text line=Line 1을 쓰거나 Vocal activity sequential을 권장합니다."
-        status = f"{mode_note}: 입력 {len(lyric_blocks)}블록을 자막 {len(captions)}개로 모두 보존했습니다. LRC {lrc_count}줄, 평균 매칭 점수 {avg_score:.2f}. {lrc_status}{warning}"
+        duplicate_note = " / 전체 가사 중복 붙여넣기 1회 자동 제거" if duplicate_removed else ""
+        status = f"{mode_note}: 입력 {len(lyric_blocks)}블록을 자막 {len(captions)}개로 모두 보존했습니다. LRC {lrc_count}줄, 평균 매칭 점수 {avg_score:.2f}. {lrc_status}{warning}{duplicate_note}"
         meta_path.write_text(
             json.dumps(
                 {
@@ -1461,6 +1493,7 @@ def _create_subtitles_impl(
                     "alignment_mode": alignment_mode,
                     "sync_source": sync_source,
                     "global_offset": global_offset,
+                    "duplicate_full_lyrics_removed": duplicate_removed,
                     "input_block_count": len(lyric_blocks),
                     "caption_count": len(captions),
                     "lrc_status": lrc_status,
