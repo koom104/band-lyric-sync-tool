@@ -26,8 +26,15 @@ import numpy as np
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 ROOT = Path(__file__).resolve().parent
-JOBS = ROOT / "jobs"
-JOBS.mkdir(exist_ok=True)
+_configured_data_root = os.environ.get("BAND_LYRIC_SYNC_DATA_DIR", "").strip()
+if _configured_data_root:
+    DATA_ROOT = Path(_configured_data_root).expanduser().resolve()
+elif (ROOT / ".venv").exists():
+    DATA_ROOT = ROOT
+else:
+    DATA_ROOT = Path(os.environ.get("LOCALAPPDATA", ROOT)) / "BandLyricSync"
+JOBS = DATA_ROOT / "jobs"
+JOBS.mkdir(parents=True, exist_ok=True)
 
 
 @dataclass
@@ -2570,4 +2577,9 @@ def build_app() -> gr.Blocks:
 
 
 if __name__ == "__main__":
-    build_app().launch(server_name="127.0.0.1", server_port=7860, inbrowser=True)
+    build_app().launch(
+        server_name="127.0.0.1",
+        server_port=int(os.environ.get("BAND_LYRIC_SYNC_PORT", "7860")),
+        inbrowser=os.environ.get("BAND_LYRIC_SYNC_OPEN_BROWSER", "1") != "0",
+        show_error=True,
+    )

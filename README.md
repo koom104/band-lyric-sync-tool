@@ -14,6 +14,21 @@ cd band-lyric-sync-tool
 브라우저에 표시되는 로컬 주소를 열면 됩니다.
 이미 실행 중이면 [http://127.0.0.1:7860](http://127.0.0.1:7860)으로 접속하면 됩니다.
 
+## Windows 배포본
+
+개발 환경에서 설치본과 portable 압축 파일을 만들려면:
+
+```powershell
+.\build-release.ps1
+```
+
+- 설치본: `release/BandLyricSync-Setup-0.1.0-win64.exe`
+- Portable: `release/BandLyricSync-0.1.0-portable-win64.zip`
+- 설치본 빌드에는 Inno Setup 6가 필요합니다.
+- Python, CUDA 런타임, FFmpeg는 배포본에 포함됩니다.
+- Whisper와 Demucs 모델은 최초 사용 시 `%LOCALAPPDATA%\BandLyricSync\cache`에 다운로드됩니다.
+- 작업 결과와 로그도 `%LOCALAPPDATA%\BandLyricSync`에 저장됩니다.
+
 ## 사용 흐름
 
 1. 공연 영상 파일을 업로드합니다.

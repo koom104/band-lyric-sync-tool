@@ -1,0 +1,29 @@
+Band Lyric Sync - Third-Party Notices
+=====================================
+
+This distribution includes third-party software. The applicable license files
+remain included with each component.
+
+Python 3.11.9
+  Copyright Python Software Foundation and contributors.
+  License: PSF License Agreement.
+  Included file: runtime/LICENSE.txt
+  Source: https://www.python.org/downloads/source/
+
+FFmpeg 8.1.1 full build
+  Copyright FFmpeg developers.
+  License information: run "bin\ffmpeg.exe -L".
+  Upstream source: https://ffmpeg.org/download.html
+  Windows build source and notices: https://www.gyan.dev/ffmpeg/builds/
+
+PyTorch 2.3.1 and Torchaudio 2.3.1
+  Copyright PyTorch contributors.
+  License files:
+    runtime\Lib\site-packages\torch\LICENSE
+    runtime\Lib\site-packages\torchaudio-2.3.1+cu121.dist-info\LICENSE
+
+Gradio, Demucs, Faster Whisper, Stable-ts, Sync Toolbox, yt-dlp, and other
+Python dependencies retain package metadata and license notices under:
+  runtime\Lib\site-packages\*.dist-info
+
+This notice does not replace the license text distributed with each component.
