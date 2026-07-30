@@ -85,6 +85,50 @@ class AlignmentTests(unittest.TestCase):
             "invalid",
         )
 
+    def test_forced_timing_requires_two_agreeing_candidates(self):
+        caption = app.CaptionLine(10.0, 14.0, "line")
+        candidates = [
+            app.ForcedTimingCandidate(10.7, 14.4, 0.2, 0.0, "1-6"),
+            app.ForcedTimingCandidate(10.9, 14.6, 0.1, 0.0, "1-8"),
+        ]
+
+        timing = app._select_forced_timing_consensus(caption, candidates)
+
+        self.assertIsNotNone(timing)
+        self.assertAlmostEqual(timing[0], 10.8)
+        self.assertAlmostEqual(timing[1], 14.5)
+
+    def test_forced_timing_rejects_disagreement_and_collapsed_words(self):
+        caption = app.CaptionLine(10.0, 14.0, "line")
+        disagreement = [
+            app.ForcedTimingCandidate(8.5, 12.0, 0.3, 0.0, "1-6"),
+            app.ForcedTimingCandidate(11.0, 15.0, 0.3, 0.0, "1-8"),
+        ]
+        collapsed = [
+            app.ForcedTimingCandidate(10.2, 13.0, 0.01, 1.0, "1-6"),
+            app.ForcedTimingCandidate(10.3, 13.1, 0.02, 1.0, "1-8"),
+        ]
+
+        self.assertIsNone(app._select_forced_timing_consensus(caption, disagreement))
+        self.assertIsNone(app._select_forced_timing_consensus(caption, collapsed))
+
+    def test_forced_timing_never_overrides_dtw_by_more_than_one_second(self):
+        caption = app.CaptionLine(10.0, 14.0, "line")
+        candidates = [
+            app.ForcedTimingCandidate(11.4, 15.0, 0.9, 0.0, "1-6"),
+            app.ForcedTimingCandidate(11.5, 15.1, 0.9, 0.0, "1-8"),
+        ]
+
+        self.assertIsNone(app._select_forced_timing_consensus(caption, candidates))
+
+    def test_auto_language_uses_the_sync_text_script(self):
+        korean = [app.LyricBlock("한국어\ntranslation", "한국어 가사입니다")]
+        japanese = [app.LyricBlock("日本語", "これは日本語です")]
+
+        self.assertEqual(app.infer_lyric_language(korean, "auto"), "ko")
+        self.assertEqual(app.infer_lyric_language(japanese, "auto"), "ja")
+        self.assertEqual(app.infer_lyric_language(korean, "en"), "en")
+
     def test_lrclib_ranking_tolerates_metadata_variations(self):
         records = [
             {

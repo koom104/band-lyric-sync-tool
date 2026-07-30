@@ -58,6 +58,15 @@ class TimedLyric:
     text: str
 
 
+@dataclass
+class ForcedTimingCandidate:
+    start: float
+    end: float
+    confidence: float
+    collapsed_ratio: float
+    source: str
+
+
 def run(cmd: list[str], cwd: Path | None = None) -> None:
     env = os.environ.copy()
     env.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -1520,6 +1529,206 @@ def warp_captions_with_dtw(
     return warped, status
 
 
+def _forced_alignment_chunks(item_count: int) -> list[tuple[int, int]]:
+    chunks: set[tuple[int, int]] = set()
+    for size, stride in ((6, 6), (8, 4)):
+        for start in range(0, item_count, stride):
+            end = min(item_count, start + size)
+            if end - start >= 3:
+                chunks.add((start, end))
+        if item_count >= 3:
+            chunks.add((max(0, item_count - size), item_count))
+    return sorted(chunks)
+
+
+def _select_forced_timing_consensus(
+    caption: CaptionLine,
+    candidates: list[ForcedTimingCandidate],
+) -> tuple[float, float] | None:
+    valid = [
+        candidate
+        for candidate in candidates
+        if abs(candidate.start - caption.start) <= 3.0
+        and candidate.end > candidate.start + 0.08
+    ]
+    if len(valid) < 2:
+        return None
+
+    pairs: list[tuple[float, ForcedTimingCandidate, ForcedTimingCandidate]] = []
+    for left_index, left in enumerate(valid):
+        for right in valid[left_index + 1 :]:
+            if left.source == right.source:
+                continue
+            start_difference = abs(left.start - right.start)
+            end_difference = abs(left.end - right.end)
+            pairs.append((start_difference + 0.15 * end_difference, left, right))
+    if not pairs:
+        return None
+
+    _, left, right = min(pairs, key=lambda pair: pair[0])
+    if abs(left.start - right.start) > 0.60:
+        return None
+    if (
+        left.collapsed_ratio >= 0.75
+        and right.collapsed_ratio >= 0.75
+        and max(left.confidence, right.confidence) < 0.04
+    ):
+        return None
+
+    start = float(np.median([left.start, right.start]))
+    if abs(start - caption.start) > 1.0:
+        return None
+
+    end = caption.end
+    if (
+        abs(left.end - right.end) <= 1.0
+        and min(left.end, right.end) > start + 0.35
+    ):
+        proposed_end = float(np.median([left.end, right.end]))
+        if abs(proposed_end - caption.end) <= 3.0:
+            end = proposed_end
+    return start, end
+
+
+@lru_cache(maxsize=2)
+def _load_forced_alignment_model(device: str):
+    import stable_whisper
+
+    return stable_whisper.load_model("base", device=device)
+
+
+def infer_lyric_language(blocks: list[LyricBlock], configured_language: str) -> str | None:
+    if configured_language != "auto":
+        return configured_language
+    text = "\n".join(block.sync_text for block in blocks)
+    hangul_count = len(re.findall(r"[\uac00-\ud7a3]", text))
+    kana_count = len(re.findall(r"[\u3040-\u30ff]", text))
+    latin_count = len(re.findall(r"[A-Za-z]", text))
+    if hangul_count >= max(1, kana_count, latin_count):
+        return "ko"
+    if kana_count >= max(1, hangul_count):
+        return "ja"
+    if latin_count:
+        return "en"
+    return None
+
+
+def refine_captions_with_performance_vocals(
+    captions: list[CaptionLine],
+    blocks: list[LyricBlock],
+    vocal_audio: Path,
+    work_dir: Path,
+    duration: float,
+    language: str,
+) -> tuple[list[CaptionLine], str]:
+    if len(captions) < 3 or len(captions) != len(blocks):
+        return captions, "vocal refinement skipped: caption/block count mismatch"
+
+    try:
+        import librosa
+
+        samples, sample_rate = librosa.load(vocal_audio, sr=16000, mono=True)
+        device = "cuda" if torch_cuda_available() else "cpu"
+        model = _load_forced_alignment_model(device)
+        candidates: list[list[ForcedTimingCandidate]] = [[] for _ in captions]
+        diagnostics: list[dict[str, object]] = []
+
+        align_language = infer_lyric_language(blocks, language)
+        for start_index, end_index in _forced_alignment_chunks(len(captions)):
+            window_start = max(0.0, captions[start_index].start - 1.5)
+            window_end = min(duration, captions[end_index - 1].end + 1.5)
+            clip = samples[
+                int(window_start * sample_rate) : int(window_end * sample_rate)
+            ]
+            text = "\n".join(block.sync_text for block in blocks[start_index:end_index])
+            result = model.align(
+                clip,
+                text,
+                language=align_language,
+                original_split=True,
+                nonspeech_skip=2.0,
+                failure_threshold=0.5,
+            )
+            segments = result.to_dict().get("segments", []) if result else []
+            if len(segments) != end_index - start_index:
+                diagnostics.append(
+                    {
+                        "source": f"{start_index + 1}-{end_index}",
+                        "error": f"expected {end_index - start_index} segments, got {len(segments)}",
+                    }
+                )
+                continue
+
+            source = f"{start_index + 1}-{end_index}"
+            for offset, segment in enumerate(segments):
+                words = segment.get("words") or []
+                probabilities = [
+                    float(word.get("probability") or 0.0) for word in words
+                ]
+                collapsed_ratio = sum(
+                    float(word.get("end") or 0.0) - float(word.get("start") or 0.0) < 0.04
+                    for word in words
+                ) / max(1, len(words))
+                candidate = ForcedTimingCandidate(
+                    start=window_start + float(segment.get("start") or 0.0),
+                    end=window_start + float(segment.get("end") or 0.0),
+                    confidence=sum(probabilities) / max(1, len(probabilities)),
+                    collapsed_ratio=collapsed_ratio,
+                    source=source,
+                )
+                candidates[start_index + offset].append(candidate)
+
+        proposed = [
+            _select_forced_timing_consensus(caption, line_candidates)
+            for caption, line_candidates in zip(captions, candidates)
+        ]
+        starts = [
+            timing[0] if timing is not None else caption.start
+            for caption, timing in zip(captions, proposed)
+        ]
+        for index in range(1, len(starts)):
+            if starts[index] <= starts[index - 1] + 0.12:
+                starts[index] = captions[index].start
+            if starts[index] <= starts[index - 1] + 0.12:
+                starts[index] = starts[index - 1] + 0.12
+
+        refined: list[CaptionLine] = []
+        accepted = 0
+        for index, caption in enumerate(captions):
+            start = min(duration, max(0.0, starts[index]))
+            next_start = starts[index + 1] if index + 1 < len(starts) else duration
+            proposed_end = proposed[index][1] if proposed[index] is not None else caption.end
+            end = min(duration, proposed_end, next_start - 0.05)
+            if end <= start + 0.20:
+                end = min(duration, max(start + 0.20, next_start - 0.05))
+            refined.append(CaptionLine(start, end, caption.text, caption.score))
+            if proposed[index] is not None:
+                accepted += 1
+            diagnostics.append(
+                {
+                    "index": index + 1,
+                    "dtw_start": caption.start,
+                    "refined_start": start,
+                    "accepted": proposed[index] is not None,
+                    "candidates": [
+                        candidate.__dict__ for candidate in candidates[index]
+                    ],
+                }
+            )
+
+        work_dir.mkdir(parents=True, exist_ok=True)
+        (work_dir / "vocal_refinement.json").write_text(
+            json.dumps(diagnostics, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return (
+            refined,
+            f"vocal forced-alignment consensus {accepted}/{len(captions)} lines ({device})",
+        )
+    except Exception as exc:
+        return captions, f"vocal refinement fallback to DTW: {type(exc).__name__}: {exc}"
+
+
 def validate_caption_sequence(captions: list[CaptionLine], expected_count: int) -> None:
     if len(captions) != expected_count:
         raise gr.Error(
@@ -2136,8 +2345,24 @@ def _create_subtitles_impl(
                 job,
                 duration,
             )
+            vocal_refinement_status = ""
+            if separate_first:
+                performance_vocals = separate_vocals(
+                    audio,
+                    job / "performance_vocal_refinement",
+                )
+                captions, vocal_refinement_status = refine_captions_with_performance_vocals(
+                    captions,
+                    lyric_blocks,
+                    performance_vocals,
+                    job / "vocal_refinement",
+                    duration,
+                    language,
+                )
             mode_note = "Reference audio DTW"
             lrc_status = f"{lrc_status} / {reference_note} / {dtw_status}"
+            if vocal_refinement_status:
+                lrc_status = f"{lrc_status} / {vocal_refinement_status}"
         elif alignment_mode == "LRCLIB synced lyrics" or use_lrclib:
             lrc_text, lrc_status = fetch_lrclib_synced_lyrics(artist, song_title, duration, len(lyric_blocks))
             if lrc_text:
@@ -2292,7 +2517,7 @@ def build_app() -> gr.Blocks:
                     value="Keep LRC start, fit end",
                 )
                 model_size = gr.Dropdown(label="Whisper model", choices=["small", "medium", "large-v3"], value="medium")
-                language = gr.Dropdown(label="Language", choices=["ko", "en", "ja", "auto"], value="ja")
+                language = gr.Dropdown(label="Language", choices=["ko", "en", "ja", "auto"], value="auto")
                 separate_first = gr.Checkbox(label="Separate vocals first", value=True)
                 burn_video = gr.Checkbox(label="Create subtitled MP4", value=True)
 
