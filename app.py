@@ -150,14 +150,93 @@ def download_youtube_reference(url: str, work_dir: Path) -> Path:
         "--no-playlist",
         "-f",
         "bestaudio/best",
+        "--write-info-json",
         "-o",
         output_template,
         url.strip(),
     ])
-    candidates = [p for p in work_dir.glob("reference_download.*") if p.is_file()]
+    candidates = [
+        p
+        for p in work_dir.glob("reference_download.*")
+        if p.is_file() and not p.name.endswith(".info.json")
+    ]
     if not candidates:
         raise gr.Error("Reference audio download finished, but no file was found.")
     return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def _reference_metadata_from_payload(
+    payload: dict,
+    fallback_artist: str,
+    fallback_title: str,
+) -> tuple[str, str]:
+    artist = str(payload.get("artist") or payload.get("creator") or "").strip()
+    track = str(payload.get("track") or payload.get("alt_title") or "").strip()
+    video_title = str(payload.get("title") or "").strip()
+    channel = str(payload.get("channel") or payload.get("uploader") or "").strip()
+
+    cleaned_title = re.sub(
+        r"[\(\[\{][^)\]\}]*\b(?:official|audio|video|lyrics?|mv)\b[^)\]\}]*[\)\]\}]",
+        "",
+        video_title,
+        flags=re.IGNORECASE,
+    ).strip()
+    if not track and " - " in cleaned_title:
+        title_artist, title_track = cleaned_title.split(" - ", 1)
+        artist = artist or title_artist.strip()
+        track = title_track.strip()
+    if not track:
+        track = cleaned_title
+    track = re.split(r"\s*[|｜]\s*", track, maxsplit=1)[0].strip()
+    if not artist and channel:
+        artist = re.sub(r"\s*-\s*Topic\s*$", "", channel, flags=re.IGNORECASE).strip()
+    return artist or fallback_artist, track or fallback_title
+
+
+def read_reference_download_metadata(
+    work_dir: Path,
+    fallback_artist: str,
+    fallback_title: str,
+) -> tuple[str, str]:
+    info_files = list(work_dir.glob("reference_download*.info.json"))
+    if not info_files:
+        return fallback_artist, fallback_title
+    info_path = max(info_files, key=lambda path: path.stat().st_mtime)
+    try:
+        payload = json.loads(info_path.read_text(encoding="utf-8"))
+    except Exception:
+        return fallback_artist, fallback_title
+    return _reference_metadata_from_payload(payload, fallback_artist, fallback_title)
+
+
+def probe_youtube_reference_details(
+    url: str,
+    fallback_artist: str,
+    fallback_title: str,
+) -> tuple[str, str, float | None]:
+    if not url.strip():
+        return fallback_artist, fallback_title, None
+    try:
+        raw = run_output([
+            os.sys.executable,
+            "-m",
+            "yt_dlp",
+            "--dump-single-json",
+            "--skip-download",
+            "--no-playlist",
+            "--no-warnings",
+            url.strip(),
+        ])
+        payload = json.loads(raw)
+    except Exception:
+        return fallback_artist, fallback_title, None
+    artist, title = _reference_metadata_from_payload(
+        payload,
+        fallback_artist,
+        fallback_title,
+    )
+    duration = float(payload.get("duration") or 0) or None
+    return artist, title, duration
 
 
 def _youtube_search_reference(
@@ -229,14 +308,22 @@ def prepare_reference_audio(
     song_title: str,
     target_duration: float,
     work_dir: Path,
-) -> tuple[Path, str]:
+) -> tuple[Path, str, str, str]:
     reference_path = resolve_uploaded_path(reference_file)
     source_note = ""
+    lookup_artist = artist
+    lookup_title = song_title
     if reference_path and reference_path.exists():
         source = reference_path
         source_note = f"reference file: {source.name}"
     elif reference_youtube_url and reference_youtube_url.strip():
-        source = download_youtube_reference(reference_youtube_url, work_dir / "youtube_reference")
+        youtube_dir = work_dir / "youtube_reference"
+        source = download_youtube_reference(reference_youtube_url, youtube_dir)
+        lookup_artist, lookup_title = read_reference_download_metadata(
+            youtube_dir,
+            artist,
+            song_title,
+        )
         source_note = "reference YouTube URL"
         source_duration = ffprobe_duration(source)
         duration_error = abs(source_duration - target_duration) / max(1.0, target_duration)
@@ -249,6 +336,11 @@ def prepare_reference_audio(
             )
             if replacement is not None:
                 source = replacement
+                lookup_artist, lookup_title = read_reference_download_metadata(
+                    work_dir / "youtube_reference_auto",
+                    artist,
+                    song_title,
+                )
                 source_note = (
                     f"provided YouTube duration mismatch {source_duration:.1f}s vs {target_duration:.1f}s; "
                     f"{search_note}"
@@ -262,7 +354,7 @@ def prepare_reference_audio(
         raise gr.Error("Reference audio DTW 모드에서는 reference audio file 또는 reference YouTube URL이 필요합니다.")
     reference_wav = work_dir / "reference_22050.wav"
     extract_alignment_audio(source, reference_wav)
-    return reference_wav, source_note
+    return reference_wav, source_note, lookup_artist, lookup_title
 
 
 def separate_vocals(audio: Path, work_dir: Path) -> Path:
@@ -282,10 +374,12 @@ def separate_vocals(audio: Path, work_dir: Path) -> Path:
         device,
         str(audio),
     ])
-    candidates = list(out_dir.glob("**/vocals.wav"))
+    candidates = list(out_dir.glob(f"**/{audio.stem}/vocals.wav"))
+    if not candidates:
+        candidates = list(out_dir.glob("**/vocals.wav"))
     if not candidates:
         raise RuntimeError("Demucs finished, but vocals.wav was not found.")
-    return candidates[0]
+    return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
 def parse_lrc(lyrics: str, duration: float) -> list[CaptionLine] | None:
@@ -326,76 +420,263 @@ def count_lrc_lines(lrc_text: str) -> int:
     return len(parse_lrc_items(lrc_text, 24 * 3600))
 
 
-def fetch_lrclib_synced_lyrics(artist: str, song_title: str, duration: float, expected_lines: int | None = None) -> tuple[str | None, str]:
+def _simplify_track_metadata(value: str) -> str:
+    value = value.casefold()
+    value = re.sub(r"[\(\[\{].*?[\)\]\}]", " ", value)
+    value = re.sub(r"\b(?:feat(?:uring)?|ft|official|audio|video|lyrics?|mv)\b.*", " ", value)
+    return re.sub(r"[^0-9a-z\u3040-\u30ff\u3400-\u9fff\uac00-\ud7a3]+", "", value)
+
+
+def _metadata_similarity(left: str, right: str) -> float:
+    left_key = _simplify_track_metadata(left)
+    right_key = _simplify_track_metadata(right)
+    if not left_key or not right_key:
+        return 0.0
+    if left_key in right_key or right_key in left_key:
+        return min(len(left_key), len(right_key)) / max(len(left_key), len(right_key))
+    return SequenceMatcher(None, left_key, right_key).ratio()
+
+
+def _lrclib_request(params: dict[str, str]) -> list[dict]:
+    query = urllib.parse.urlencode(params)
+    url = f"https://lrclib.net/api/search?{query}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "band-lyric-sync-tool/1.1 (https://github.com/koom104/band-lyric-sync-tool)"
+        },
+    )
+    with urllib.request.urlopen(req, timeout=12) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    return payload if isinstance(payload, list) else []
+
+
+def _title_search_variants(song_title: str) -> list[str]:
+    variants = [song_title.strip()]
+    without_suffix = re.split(r"\s*[|｜]\s*", song_title, maxsplit=1)[0].strip()
+    variants.append(without_suffix)
+    bracket_values = re.findall(
+        r"[\(\[\{【「『]([^)\]\}】」』]+)[\)\]\}】」』]",
+        without_suffix,
+    )
+    variants.extend(value.strip() for value in bracket_values)
+    variants.extend(
+        value.strip()
+        for value in re.findall(r"[A-Za-z0-9][A-Za-z0-9 '&.,!?\-]+", without_suffix)
+    )
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in variants:
+        value = re.sub(
+            r"\b(?:official|audio|video|lyrics?|translation|mv)\b.*",
+            "",
+            value,
+            flags=re.IGNORECASE,
+        ).strip(" -_.,! ")
+        key = value.casefold()
+        if len(value) >= 2 and key not in seen:
+            seen.add(key)
+            result.append(value)
+    return result
+
+
+def search_lrclib_candidates(artist: str, song_title: str) -> tuple[list[dict], str]:
+    artist = artist.strip()
+    song_title = song_title.strip()
+    if not song_title:
+        return [], "LRCLIB lookup skipped: song title is empty."
+
+    title_variants = _title_search_variants(song_title)
+    attempts = [
+        {"track_name": song_title, "artist_name": artist},
+        {"q": f"{artist} {song_title}".strip()},
+    ]
+    attempts.extend({"track_name": variant} for variant in title_variants)
+
+    records_by_key: dict[str, dict] = {}
+    errors: list[str] = []
+    unique_attempts: list[dict[str, str]] = []
+    seen_attempts: set[str] = set()
+    for params in attempts:
+        key = urllib.parse.urlencode(params)
+        if key not in seen_attempts:
+            seen_attempts.add(key)
+            unique_attempts.append(params)
+
+    for attempt_idx, params in enumerate(unique_attempts[:5]):
+        if not all(params.values()):
+            continue
+        try:
+            records = _lrclib_request(params)
+        except urllib.error.HTTPError as exc:
+            errors.append(f"HTTP {exc.code}")
+            if exc.code == 429:
+                break
+            continue
+        except Exception as exc:
+            errors.append(str(exc))
+            continue
+        for record in records:
+            key = str(
+                record.get("id")
+                or (
+                    record.get("artistName"),
+                    record.get("trackName"),
+                    record.get("albumName"),
+                    record.get("duration"),
+                )
+            )
+            records_by_key[key] = record
+        if attempt_idx + 1 < min(5, len(unique_attempts)):
+            time.sleep(0.25)
+
+    if records_by_key:
+        return list(records_by_key.values()), ""
+    if errors:
+        return [], f"LRCLIB lookup failed: {errors[-1]}"
+    return [], "LRCLIB returned no candidates."
+
+
+def rank_lrclib_candidates(
+    records: list[dict],
+    artist: str,
+    song_title: str,
+    duration: float | None,
+    expected_lines: int | None,
+) -> list[tuple[float, dict]]:
+    ranked: list[tuple[float, dict]] = []
+    for record in records:
+        synced = str(record.get("syncedLyrics") or "").strip()
+        if not synced:
+            continue
+        track = str(record.get("trackName") or "")
+        found_artist = str(record.get("artistName") or "")
+        title_score = _metadata_similarity(song_title, track)
+        artist_score = _metadata_similarity(artist, found_artist) if artist.strip() else 0.75
+
+        duration_score = 0.5
+        record_duration = float(record.get("duration") or 0)
+        if duration is not None and duration > 0 and record_duration > 0:
+            duration_tolerance = max(12.0, duration * 0.08)
+            duration_score = max(0.0, 1.0 - abs(record_duration - duration) / duration_tolerance)
+        cross_script_duration_match = (
+            duration is not None
+            and title_score >= 0.58
+            and duration_score >= 0.70
+        )
+        if title_score < 0.42 or (
+            artist_score < 0.20
+            and title_score < 0.82
+            and not cross_script_duration_match
+        ):
+            continue
+
+        line_score = 0.5
+        if expected_lines:
+            lrc_lines = count_lrc_lines(synced)
+            line_score = max(
+                0.0,
+                1.0 - abs(lrc_lines - expected_lines) / max(lrc_lines, expected_lines),
+            )
+        score = (
+            0.56 * title_score
+            + 0.24 * artist_score
+            + 0.15 * duration_score
+            + 0.05 * line_score
+        )
+        ranked.append((score, record))
+    return sorted(ranked, key=lambda item: item[0], reverse=True)
+
+
+def fetch_lrclib_synced_lyrics(
+    artist: str,
+    song_title: str,
+    duration: float,
+    expected_lines: int | None = None,
+) -> tuple[str | None, str]:
     if not artist.strip() or not song_title.strip():
         return None, "LRCLIB lookup skipped: artist or song title is empty."
-    attempts = [
-        {
-            "artist_name": artist.strip(),
-            "track_name": song_title.strip(),
-            "duration": str(int(round(duration))),
-        },
-        {
-            "artist_name": artist.strip(),
-            "track_name": song_title.strip(),
-        },
-    ]
-    last_status = "LRCLIB synced lyrics not found."
-    best_synced: str | None = None
-    best_status = last_status
-    best_distance = 10**9
-    for params in attempts:
-        query = urllib.parse.urlencode(params)
-        url = f"https://lrclib.net/api/get?{query}"
-        req = urllib.request.Request(url, headers={"User-Agent": "band-lyric-sync-tool/1.0"})
-        try:
-            with urllib.request.urlopen(req, timeout=12) as response:
-                data = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            if exc.code == 404:
-                last_status = "LRCLIB synced lyrics not found."
-                continue
-            return None, f"LRCLIB lookup failed: HTTP {exc.code}"
-        except Exception as exc:
-            return None, f"LRCLIB lookup failed: {exc}"
-        synced = data.get("syncedLyrics")
-        if synced and synced.strip():
-            track = data.get("trackName") or song_title
-            found_artist = data.get("artistName") or artist
-            if expected_lines is None:
-                return synced, f"LRCLIB synced lyrics found: {found_artist} - {track}"
-            distance = abs(count_lrc_lines(synced) - expected_lines)
-            if distance < best_distance:
-                best_synced = synced
-                best_status = f"LRCLIB synced lyrics found: {found_artist} - {track}"
-                best_distance = distance
-        last_status = "LRCLIB result did not include synced lyrics."
+    records, search_status = search_lrclib_candidates(artist, song_title)
+    ranked = rank_lrclib_candidates(
+        records,
+        artist,
+        song_title,
+        duration,
+        expected_lines,
+    )
+    if not ranked:
+        return None, search_status or "LRCLIB synced lyrics not found."
 
-    search_query = urllib.parse.urlencode({"artist_name": artist.strip(), "track_name": song_title.strip()})
-    search_url = f"https://lrclib.net/api/search?{search_query}"
-    try:
-        req = urllib.request.Request(search_url, headers={"User-Agent": "band-lyric-sync-tool/1.0"})
-        with urllib.request.urlopen(req, timeout=12) as response:
-            records = json.loads(response.read().decode("utf-8"))
-    except Exception:
-        records = []
-    for record in records if isinstance(records, list) else []:
-        synced = record.get("syncedLyrics")
-        if not synced or not synced.strip():
-            continue
-        track = record.get("trackName") or song_title
-        found_artist = record.get("artistName") or artist
-        distance = abs(count_lrc_lines(synced) - expected_lines) if expected_lines is not None else 0
-        if distance < best_distance:
-            best_synced = synced
-            best_status = f"LRCLIB synced lyrics found: {found_artist} - {track}"
-            best_distance = distance
+    confidence, record = ranked[0]
+    synced = str(record["syncedLyrics"]).strip()
+    track = str(record.get("trackName") or song_title)
+    found_artist = str(record.get("artistName") or artist)
+    status_prefix = "LRCLIB synced lyrics found"
+    if (
+        _metadata_similarity(artist, found_artist) < 0.98
+        or _metadata_similarity(song_title, track) < 0.98
+    ):
+        status_prefix = (
+            f'LRCLIB auto-matched "{artist} - {song_title}" '
+            f'to "{found_artist} - {track}"'
+        )
+    else:
+        status_prefix += f": {found_artist} - {track}"
+    status = f"{status_prefix} / confidence {confidence:.2f}"
+    if expected_lines is not None:
+        status += (
+            f" / LRC lines {count_lrc_lines(synced)}, "
+            f"input blocks {expected_lines}"
+        )
+    return synced, status
 
-    if best_synced:
-        if expected_lines is not None:
-            best_status += f" / LRC lines {count_lrc_lines(best_synced)}, input blocks {expected_lines}"
-        return best_synced, best_status
-    return None, last_status
+
+def autocomplete_lrclib_fields(
+    artist: str,
+    song_title: str,
+    reference_youtube_url: str,
+) -> tuple[str, str, str]:
+    search_pairs = [(artist, song_title, "입력값")]
+    detected_artist, detected_title, detected_duration = probe_youtube_reference_details(
+        reference_youtube_url,
+        artist,
+        song_title,
+    )
+    if (
+        _metadata_similarity(artist, detected_artist) < 0.98
+        or _metadata_similarity(song_title, detected_title) < 0.98
+    ):
+        search_pairs.insert(0, (detected_artist, detected_title, "YouTube 메타데이터"))
+
+    ranked_matches: list[tuple[float, dict, str]] = []
+    statuses: list[str] = []
+    for lookup_artist, lookup_title, source in search_pairs:
+        records, search_status = search_lrclib_candidates(lookup_artist, lookup_title)
+        if search_status:
+            statuses.append(search_status)
+        ranked = rank_lrclib_candidates(
+            records,
+            lookup_artist,
+            lookup_title,
+            detected_duration if source == "YouTube 메타데이터" else None,
+            None,
+        )
+        if ranked:
+            confidence, record = ranked[0]
+            ranked_matches.append((confidence, record, source))
+            if confidence >= 0.88:
+                break
+
+    if not ranked_matches:
+        return artist, song_title, statuses[-1] if statuses else "LRCLIB 후보를 찾지 못했습니다."
+    confidence, record, source = max(ranked_matches, key=lambda item: item[0])
+    found_artist = str(record.get("artistName") or artist)
+    track = str(record.get("trackName") or song_title)
+    return (
+        found_artist,
+        track,
+        f'LRCLIB 입력 자동완성({source}): "{found_artist} - {track}" / confidence {confidence:.2f}',
+    )
 
 
 def choose_sync_text(display_text: str, sync_source: str) -> str:
@@ -484,7 +765,12 @@ def remove_duplicate_full_lyrics(lyrics: str) -> tuple[str, bool]:
     return lyrics, False
 
 
-def transcribe(audio: Path, model_size: str, language: str) -> list[WhisperSegment]:
+def transcribe(
+    audio: Path,
+    model_size: str,
+    language: str,
+    initial_prompt: str = "",
+) -> list[WhisperSegment]:
     from faster_whisper import WhisperModel
 
     compute_type = "float16"
@@ -501,6 +787,7 @@ def transcribe(audio: Path, model_size: str, language: str) -> list[WhisperSegme
         beam_size=5,
         word_timestamps=False,
         condition_on_previous_text=True,
+        initial_prompt=initial_prompt[:1600] or None,
     )
     result = [
         WhisperSegment(start=float(seg.start), end=float(seg.end), text=seg.text.strip())
@@ -603,6 +890,43 @@ def align_blocks_to_segments(blocks: list[LyricBlock], segments: list[WhisperSeg
     return captions
 
 
+def select_best_block_lines_for_transcript(
+    blocks: list[LyricBlock],
+    segments: list[WhisperSegment],
+) -> list[LyricBlock]:
+    if not segments:
+        return blocks
+    transcript_spans: list[str] = []
+    for start_idx in range(len(segments)):
+        for span_length in range(1, 4):
+            end_idx = start_idx + span_length
+            if end_idx <= len(segments):
+                transcript_spans.append(
+                    " ".join(segment.text for segment in segments[start_idx:end_idx])
+                )
+
+    selected: list[LyricBlock] = []
+    for block in blocks:
+        candidates = [line.strip() for line in block.text.splitlines() if line.strip()]
+        if block.sync_text not in candidates:
+            candidates.append(block.sync_text)
+        best_text = block.sync_text
+        best_score = max(
+            (similarity(best_text, span) for span in transcript_spans),
+            default=0.0,
+        )
+        for candidate in candidates:
+            candidate_score = max(
+                (similarity(candidate, span) for span in transcript_spans),
+                default=0.0,
+            )
+            if candidate_score > best_score + 0.03:
+                best_text = candidate
+                best_score = candidate_score
+        selected.append(LyricBlock(text=block.text, sync_text=best_text))
+    return selected
+
+
 def align_lines_to_segments(lines: list[str], segments: list[WhisperSegment], duration: float) -> list[CaptionLine]:
     return align_blocks_to_segments([LyricBlock(text=line, sync_text=line) for line in lines], segments, duration)
 
@@ -697,6 +1021,64 @@ def align_blocks_by_activity(blocks: list[LyricBlock], audio: Path, work_dir: Pa
         last_end = end
         captions.append(CaptionLine(max(0.0, start), end, block.text, 0.0))
     return captions
+
+
+def align_blocks_to_reference_without_lrc(
+    blocks: list[LyricBlock],
+    reference_audio: Path,
+    work_dir: Path,
+    duration: float,
+    model_size: str,
+    language: str,
+    separate_first: bool,
+) -> tuple[list[CaptionLine], list[WhisperSegment], float, str]:
+    alignment_audio = reference_audio
+    notes: list[str] = []
+    if separate_first:
+        try:
+            alignment_audio = separate_vocals(
+                reference_audio,
+                work_dir / "reference_forced_alignment",
+            )
+            notes.append("Demucs reference vocals")
+        except Exception as exc:
+            notes.append(f"Demucs fallback to full mix ({type(exc).__name__})")
+
+    prompt = " ".join(block.text.replace("\n", " ") for block in blocks)
+    segments: list[WhisperSegment] = []
+    try:
+        segments = transcribe(
+            alignment_audio,
+            model_size,
+            language,
+            initial_prompt=prompt,
+        )
+    except Exception as exc:
+        notes.append(f"Whisper failed ({type(exc).__name__})")
+
+    if segments:
+        adaptive_blocks = select_best_block_lines_for_transcript(blocks, segments)
+        captions = align_blocks_to_segments(adaptive_blocks, segments, duration)
+        average_score = sum(caption.score for caption in captions) / max(1, len(captions))
+        coverage = sum(caption.score >= 0.15 for caption in captions) / max(1, len(captions))
+        if average_score >= 0.18 or coverage >= 0.45:
+            notes.append(
+                f"Whisper reference alignment {len(segments)} segments, "
+                f"score {average_score:.2f}, coverage {coverage:.0%}"
+            )
+            return captions, segments, average_score, " / ".join(notes)
+        notes.append(
+            f"Whisper confidence low (score {average_score:.2f}, coverage {coverage:.0%})"
+        )
+
+    captions = align_blocks_by_activity(
+        blocks,
+        alignment_audio,
+        work_dir / "reference_activity",
+        duration,
+    )
+    notes.append("vocal-activity sequential fallback")
+    return captions, segments, 0.0, " / ".join(notes)
 
 
 def apply_global_offset(captions: list[CaptionLine], offset_seconds: float, duration: float) -> list[CaptionLine]:
@@ -1681,7 +2063,12 @@ def _create_subtitles_impl(
         segments: list[WhisperSegment] = []
         lrc_status = ""
         if alignment_mode == "Reference audio DTW":
-            reference_audio, reference_note = prepare_reference_audio(
+            (
+                reference_audio,
+                reference_note,
+                reference_artist,
+                reference_title,
+            ) = prepare_reference_audio(
                 reference_file,
                 reference_youtube_url,
                 artist,
@@ -1690,10 +2077,56 @@ def _create_subtitles_impl(
                 job,
             )
             reference_duration = ffprobe_duration(reference_audio)
-            lrc_text, lrc_status = fetch_lrclib_synced_lyrics(artist, song_title, reference_duration, len(lyric_blocks))
-            if not lrc_text:
-                raise gr.Error(f"Reference audio DTW requires synced lyrics. {lrc_status}")
-            reference_captions, avg_score, lrc_count = align_blocks_to_lrc(lyric_blocks, lrc_text, reference_duration)
+            lrc_text, lrc_status = fetch_lrclib_synced_lyrics(
+                reference_artist,
+                reference_title,
+                reference_duration,
+                len(lyric_blocks),
+            )
+            if not lrc_text and (
+                _metadata_similarity(artist, reference_artist) < 0.98
+                or _metadata_similarity(song_title, reference_title) < 0.98
+            ):
+                lrc_text, lrc_status = fetch_lrclib_synced_lyrics(
+                    artist,
+                    song_title,
+                    reference_duration,
+                    len(lyric_blocks),
+                )
+            elif lrc_text and (
+                _metadata_similarity(artist, reference_artist) < 0.98
+                or _metadata_similarity(song_title, reference_title) < 0.98
+            ):
+                lrc_status = (
+                    f'YouTube metadata "{reference_artist} - {reference_title}" / '
+                    f"{lrc_status}"
+                )
+            if lrc_text:
+                reference_captions, avg_score, lrc_count = align_blocks_to_lrc(
+                    lyric_blocks,
+                    lrc_text,
+                    reference_duration,
+                )
+            else:
+                (
+                    reference_captions,
+                    segments,
+                    avg_score,
+                    reference_alignment_status,
+                ) = align_blocks_to_reference_without_lrc(
+                    lyric_blocks,
+                    reference_audio,
+                    job,
+                    reference_duration,
+                    model_size,
+                    language,
+                    separate_first,
+                )
+                lrc_count = 0
+                lrc_status = (
+                    f"{lrc_status} / LRCLIB 미검색으로 공식 음원 자동 강제정렬: "
+                    f"{reference_alignment_status}"
+                )
             performance_alignment_audio = job / "performance_22050.wav"
             extract_alignment_audio(video, performance_alignment_audio)
             captions, dtw_status = warp_captions_with_dtw(
@@ -1823,6 +2256,7 @@ def build_app() -> gr.Blocks:
                 reference_youtube_url = gr.Textbox(label="Reference YouTube URL", placeholder="Official audio URL, used only in Reference audio DTW mode")
                 artist = gr.Textbox(label="Artist", placeholder="예: 아티스트명")
                 song_title = gr.Textbox(label="Song title", placeholder="예: 곡 제목")
+                lrclib_autocomplete = gr.Button("Find LRCLIB match")
                 lyrics = gr.Textbox(label="Lyrics or LRC", lines=16, placeholder="빈 줄로 자막 블록을 나누세요. 블록 안 줄바꿈은 한 자막 안에 유지됩니다.")
                 lyric_grouping = gr.Dropdown(
                     label="Lyric grouping",
@@ -1870,6 +2304,11 @@ def build_app() -> gr.Blocks:
             srt_file = gr.File(label="SRT")
             mp4_file = gr.File(label="Subtitled MP4")
 
+        lrclib_autocomplete.click(
+            autocomplete_lrclib_fields,
+            inputs=[artist, song_title, reference_youtube_url],
+            outputs=[artist, song_title, status],
+        )
         create.click(
             create_subtitles,
             inputs=[

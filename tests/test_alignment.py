@@ -1,4 +1,6 @@
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 import app
 
@@ -82,6 +84,104 @@ class AlignmentTests(unittest.TestCase):
             app._choose_alignment_method(0.15, 0.20, 20.0, 19.0, 12.0),
             "invalid",
         )
+
+    def test_lrclib_ranking_tolerates_metadata_variations(self):
+        records = [
+            {
+                "id": 1,
+                "trackName": "Cattleya",
+                "artistName": "Yorushika",
+                "duration": 162,
+                "syncedLyrics": "[00:10.00] first\n[00:15.00] second",
+            },
+            {
+                "id": 2,
+                "trackName": "Cattleya (Live)",
+                "artistName": "Different Artist",
+                "duration": 240,
+                "syncedLyrics": "[00:10.00] unrelated",
+            },
+        ]
+
+        ranked = app.rank_lrclib_candidates(
+            records,
+            "Yorushka",
+            "Cattleya (Official Audio)",
+            163.0,
+            2,
+        )
+
+        self.assertEqual(ranked[0][1]["id"], 1)
+        self.assertGreater(ranked[0][0], 0.8)
+
+    def test_youtube_metadata_uses_track_fields_and_title_fallback(self):
+        self.assertEqual(
+            app._reference_metadata_from_payload(
+                {"artist": "Yorushika", "track": "Cattleya"},
+                "요루시카",
+                "카틀레야",
+            ),
+            ("Yorushika", "Cattleya"),
+        )
+        self.assertEqual(
+            app._reference_metadata_from_payload(
+                {
+                    "title": "Yorushika - Cattleya (Official Audio)",
+                    "channel": "Yorushika - Topic",
+                },
+                "",
+                "",
+            ),
+            ("Yorushika", "Cattleya"),
+        )
+
+    def test_lrclib_search_extracts_english_title_alias(self):
+        variants = app._title_search_variants("カトレア【Cattleya】 | Lyrics")
+
+        self.assertIn("Cattleya", variants)
+        self.assertIn("カトレア【Cattleya】", variants)
+
+    def test_transcript_can_select_original_line_from_multiline_block(self):
+        blocks = [
+            app.LyricBlock(
+                text="당신은 알지 못해\nあなたにはわからない",
+                sync_text="당신은 알지 못해",
+            )
+        ]
+        segments = [
+            app.WhisperSegment(10.0, 13.0, "あなたにはわからない"),
+        ]
+
+        selected = app.select_best_block_lines_for_transcript(blocks, segments)
+
+        self.assertEqual(selected[0].sync_text, "あなたにはわからない")
+
+    def test_reference_alignment_falls_back_to_prompted_whisper(self):
+        blocks = [
+            app.LyricBlock("最初の歌詞", "最初の歌詞"),
+            app.LyricBlock("次の歌詞", "次の歌詞"),
+        ]
+        recognized = [
+            app.WhisperSegment(8.0, 11.0, "最初の歌詞"),
+            app.WhisperSegment(12.0, 15.0, "次の歌詞"),
+        ]
+
+        with patch.object(app, "transcribe", return_value=recognized) as mocked:
+            captions, segments, score, status = app.align_blocks_to_reference_without_lrc(
+                blocks,
+                Path("reference.wav"),
+                Path("work"),
+                30.0,
+                "medium",
+                "ja",
+                False,
+            )
+
+        self.assertEqual(len(captions), 2)
+        self.assertEqual(segments, recognized)
+        self.assertGreater(score, 0.9)
+        self.assertIn("Whisper reference alignment", status)
+        self.assertIn("最初の歌詞", mocked.call_args.kwargs["initial_prompt"])
 
 
 if __name__ == "__main__":
