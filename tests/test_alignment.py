@@ -65,6 +65,24 @@ class AlignmentTests(unittest.TestCase):
         self.assertFalse(removed)
         self.assertEqual(unchanged, chorus_song)
 
+    def test_alignment_candidate_selection_uses_quality_and_stability(self):
+        self.assertEqual(
+            app._choose_alignment_method(0.20, 0.19, 2.0, 2.0, 12.0),
+            "multiscale",
+        )
+        self.assertEqual(
+            app._choose_alignment_method(0.35, 0.20, 2.0, 2.0, 12.0),
+            "legacy",
+        )
+        self.assertEqual(
+            app._choose_alignment_method(0.15, 0.20, 20.0, 2.0, 12.0),
+            "legacy",
+        )
+        self.assertEqual(
+            app._choose_alignment_method(0.15, 0.20, 20.0, 19.0, 12.0),
+            "invalid",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -753,36 +753,44 @@ def auto_fit_captions_to_vocal_span(
     return fitted, f"auto-fit {fit_mode}: {target_start:.2f}s-{target_end:.2f}s, scale {ratio:.3f}x"
 
 
-def build_dtw_time_map(reference_audio: Path, performance_audio: Path, work_dir: Path) -> tuple[np.ndarray, np.ndarray, str]:
+def _path_to_time_axes(
+    ref_frames: np.ndarray,
+    perf_frames: np.ndarray,
+    feature_rate: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    ref_times = np.asarray(ref_frames, dtype=np.float64) / feature_rate
+    perf_times = np.asarray(perf_frames, dtype=np.float64) / feature_rate
+    order = np.argsort(ref_times)
+    ref_times = ref_times[order]
+    perf_times = perf_times[order]
+    unique_ref: list[float] = []
+    mapped_perf: list[float] = []
+    for ref_time in np.unique(ref_times):
+        values = perf_times[ref_times == ref_time]
+        unique_ref.append(float(ref_time))
+        mapped_perf.append(float(np.median(values)))
+    return (
+        np.asarray(unique_ref, dtype=np.float64),
+        np.maximum.accumulate(np.asarray(mapped_perf, dtype=np.float64)),
+    )
+
+
+def _legacy_dtw_time_map(
+    y_ref: np.ndarray,
+    y_perf: np.ndarray,
+    sample_rate: int,
+) -> tuple[np.ndarray, np.ndarray]:
     import librosa
 
-    work_dir.mkdir(parents=True, exist_ok=True)
-    sample_rate = 22050
     hop_length = 2048
-    y_ref, _ = librosa.load(str(reference_audio), sr=sample_rate, mono=True)
-    y_perf, _ = librosa.load(str(performance_audio), sr=sample_rate, mono=True)
-    if y_ref.size < sample_rate or y_perf.size < sample_rate:
-        raise gr.Error("Reference audio DTW failed: audio is too short.")
-    reference_duration = y_ref.size / sample_rate
-    performance_duration = y_perf.size / sample_rate
-    duration_ratio = max(reference_duration, performance_duration) / min(reference_duration, performance_duration)
-    if duration_ratio > 1.18:
-        raise gr.Error(
-            f"레퍼런스({reference_duration:.1f}초)와 공연({performance_duration:.1f}초)의 길이 차이가 너무 커서 "
-            "안전하게 정렬할 수 없습니다. 잘못된 시작점 생성을 중단했습니다."
-        )
-
     ref_chroma = librosa.feature.chroma_cens(y=y_ref, sr=sample_rate, hop_length=hop_length)
     perf_chroma = librosa.feature.chroma_cens(y=y_perf, sr=sample_rate, hop_length=hop_length)
-    ref_chroma = ref_chroma / np.maximum(1e-6, np.linalg.norm(ref_chroma, axis=0, keepdims=True))
-    perf_chroma = perf_chroma / np.maximum(1e-6, np.linalg.norm(perf_chroma, axis=0, keepdims=True))
-
-    # Repeated choruses can make unconstrained DTW jump to a later chorus and
-    # then jump back. Allow gradual tempo changes, but require both recordings
-    # to keep moving forward and keep the path near the song-length diagonal.
-    length_delta = abs(ref_chroma.shape[1] - perf_chroma.shape[1]) / max(ref_chroma.shape[1], perf_chroma.shape[1])
+    ref_chroma /= np.maximum(1e-6, np.linalg.norm(ref_chroma, axis=0, keepdims=True))
+    perf_chroma /= np.maximum(1e-6, np.linalg.norm(perf_chroma, axis=0, keepdims=True))
+    length_delta = abs(ref_chroma.shape[1] - perf_chroma.shape[1]) / max(
+        ref_chroma.shape[1], perf_chroma.shape[1]
+    )
     band_radius = min(0.20, max(0.08, length_delta + 0.04))
-    step_sizes = np.asarray([[1, 1], [1, 2], [2, 1]], dtype=np.uint32)
     _cost, path = librosa.sequence.dtw(
         X=ref_chroma,
         Y=perf_chroma,
@@ -791,36 +799,302 @@ def build_dtw_time_map(reference_audio: Path, performance_audio: Path, work_dir:
         backtrack=True,
         global_constraints=True,
         band_rad=band_radius,
-        step_sizes_sigma=step_sizes,
+        step_sizes_sigma=np.asarray([[1, 1], [1, 2], [2, 1]], dtype=np.uint32),
         weights_add=np.asarray([0.0, 0.08, 0.08]),
     )
     path = np.asarray(path[::-1])
-    ref_times = librosa.frames_to_time(path[:, 0], sr=sample_rate, hop_length=hop_length)
-    perf_times = librosa.frames_to_time(path[:, 1], sr=sample_rate, hop_length=hop_length)
+    feature_rate = sample_rate / hop_length
+    return _path_to_time_axes(path[:, 0], path[:, 1], feature_rate)
 
-    order = np.argsort(ref_times)
-    ref_times = ref_times[order]
-    perf_times = perf_times[order]
-    unique_ref = []
-    mapped_perf = []
-    for ref_time in np.unique(ref_times):
-        values = perf_times[ref_times == ref_time]
-        unique_ref.append(ref_time)
-        mapped_perf.append(float(np.median(values)))
-    ref_axis = np.asarray(unique_ref, dtype=np.float64)
-    perf_axis = np.maximum.accumulate(np.asarray(mapped_perf, dtype=np.float64))
+
+def _music_sync_features(
+    audio: np.ndarray,
+    sample_rate: int,
+    hop_length: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    import librosa
+    from scipy.ndimage import maximum_filter1d
+    from synctoolbox.feature.chroma import quantize_chroma
+
+    chroma = librosa.feature.chroma_stft(
+        y=audio,
+        sr=sample_rate,
+        hop_length=hop_length,
+        n_fft=4096,
+        n_chroma=12,
+        norm=2,
+    )
+    chroma /= np.maximum(1e-8, np.linalg.norm(chroma, axis=0, keepdims=True))
+    quantized = quantize_chroma(chroma)
+
+    onset = np.maximum(0.0, np.diff(chroma, axis=1, prepend=chroma[:, :1]))
+    local_max = maximum_filter1d(onset, size=40, axis=1, mode="nearest")
+    onset = np.log1p(100.0 * onset) / (np.log1p(100.0 * local_max) + 1e-8)
+    decayed = np.zeros_like(onset)
+    for decay_idx in range(10):
+        decayed[:, decay_idx:] += (
+            1.0 / np.sqrt(decay_idx + 1)
+        ) * onset[:, : onset.shape[1] - decay_idx]
+    decayed /= np.maximum(1e-8, np.linalg.norm(decayed, axis=0, keepdims=True))
+    return quantized, decayed
+
+
+def _multiscale_dtw_time_map(
+    ref_chroma: np.ndarray,
+    ref_onset: np.ndarray,
+    perf_chroma: np.ndarray,
+    perf_onset: np.ndarray,
+    feature_rate: int,
+) -> tuple[np.ndarray, np.ndarray, int, np.ndarray, np.ndarray]:
+    from synctoolbox.dtw.mrmsdtw import sync_via_mrmsdtw
+    from synctoolbox.dtw.utils import (
+        compute_optimal_chroma_shift,
+        make_path_strictly_monotonic,
+        shift_chroma_vectors,
+    )
+    from synctoolbox.feature.chroma import quantized_chroma_to_CENS
+
+    ref_cens = quantized_chroma_to_CENS(ref_chroma, 201, 50, feature_rate)[0]
+    perf_cens = quantized_chroma_to_CENS(perf_chroma, 201, 50, feature_rate)[0]
+    chroma_shift = compute_optimal_chroma_shift(ref_cens, perf_cens)
+    shifted_perf_chroma = shift_chroma_vectors(perf_chroma, chroma_shift)
+    shifted_perf_onset = shift_chroma_vectors(perf_onset, chroma_shift)
+    path = sync_via_mrmsdtw(
+        f_chroma1=ref_chroma,
+        f_chroma2=shifted_perf_chroma,
+        f_onset1=ref_onset,
+        f_onset2=shifted_perf_onset,
+        input_feature_rate=feature_rate,
+        step_weights=np.asarray([1.5, 1.5, 2.0]),
+        threshold_rec=10**6,
+        alpha=0.65,
+        verbose=False,
+    )
+    path = make_path_strictly_monotonic(path)
+    ref_axis, perf_axis = _path_to_time_axes(path[0], path[1], feature_rate)
+    return ref_axis, perf_axis, int(chroma_shift), shifted_perf_chroma, shifted_perf_onset
+
+
+def _alignment_feature_cost(
+    ref_chroma: np.ndarray,
+    ref_onset: np.ndarray,
+    perf_chroma: np.ndarray,
+    perf_onset: np.ndarray,
+    ref_axis: np.ndarray,
+    perf_axis: np.ndarray,
+    feature_rate: int,
+) -> float:
+    ref_times = np.arange(ref_chroma.shape[1], dtype=np.float64) / feature_rate
+    mapped_times = np.interp(ref_times, ref_axis, perf_axis)
+    perf_indices = np.clip(
+        np.rint(mapped_times * feature_rate).astype(int),
+        0,
+        perf_chroma.shape[1] - 1,
+    )
+
+    def cosine_cost(left: np.ndarray, right: np.ndarray) -> float:
+        left_norm = np.linalg.norm(left, axis=0)
+        right_norm = np.linalg.norm(right, axis=0)
+        active = (left_norm > 1e-6) & (right_norm > 1e-6)
+        if int(active.sum()) < 20:
+            return 1.0
+        similarities = np.sum(left[:, active] * right[:, active], axis=0)
+        similarities /= left_norm[active] * right_norm[active]
+        return float(np.mean(1.0 - np.clip(similarities, -1.0, 1.0)))
+
+    chroma_cost = cosine_cost(ref_chroma, perf_chroma[:, perf_indices])
+    onset_cost = cosine_cost(ref_onset, perf_onset[:, perf_indices])
+    return 0.75 * chroma_cost + 0.25 * onset_cost
+
+
+def _time_map_stats(
+    ref_axis: np.ndarray,
+    perf_axis: np.ndarray,
+) -> tuple[float, float, float, float]:
     offsets = perf_axis - ref_axis
-    offset_low, offset_mid, offset_high = np.percentile(offsets, [5, 50, 95])
-    offset_spread = offset_high - offset_low
-    max_stable_spread = max(12.0, min(reference_duration, performance_duration) * 0.10)
-    if offset_spread > max_stable_spread:
+    low, median, high = np.percentile(offsets, [5, 50, 95])
+    return float(low), float(median), float(high), float(high - low)
+
+
+def _choose_alignment_method(
+    multiscale_quality: float,
+    legacy_quality: float,
+    multiscale_spread: float,
+    legacy_spread: float,
+    max_stable_spread: float,
+) -> str:
+    multiscale_stable = multiscale_spread <= max_stable_spread
+    legacy_stable = legacy_spread <= max_stable_spread
+    if multiscale_stable and not legacy_stable:
+        return "multiscale"
+    if legacy_stable and not multiscale_stable:
+        return "legacy"
+    if not multiscale_stable and not legacy_stable:
+        return "invalid"
+    return "multiscale" if multiscale_quality <= legacy_quality + 0.025 else "legacy"
+
+
+def build_dtw_time_map(reference_audio: Path, performance_audio: Path, work_dir: Path) -> tuple[np.ndarray, np.ndarray, str]:
+    import librosa
+
+    work_dir.mkdir(parents=True, exist_ok=True)
+    sample_rate = 22050
+    feature_rate = 50
+    hop_length = sample_rate // feature_rate
+    y_ref, _ = librosa.load(str(reference_audio), sr=sample_rate, mono=True)
+    y_perf, _ = librosa.load(str(performance_audio), sr=sample_rate, mono=True)
+    if y_ref.size < sample_rate or y_perf.size < sample_rate:
+        raise gr.Error("Reference audio DTW failed: audio is too short.")
+    reference_duration = y_ref.size / sample_rate
+    performance_duration = y_perf.size / sample_rate
+    duration_ratio = max(reference_duration, performance_duration) / min(
+        reference_duration, performance_duration
+    )
+    if duration_ratio > 1.18:
         raise gr.Error(
-            f"DTW 시간축 변동이 {offset_spread:.1f}초로 너무 큽니다. "
+            f"레퍼런스({reference_duration:.1f}초)와 공연({performance_duration:.1f}초)의 길이 차이가 너무 커서 "
+            "안전하게 정렬할 수 없습니다. 잘못된 시작점 생성을 중단했습니다."
+        )
+
+    ref_chroma, ref_onset = _music_sync_features(y_ref, sample_rate, hop_length)
+    perf_chroma, perf_onset = _music_sync_features(y_perf, sample_rate, hop_length)
+    multiscale_result = None
+    multiscale_error = ""
+    try:
+        multiscale_result = _multiscale_dtw_time_map(
+            ref_chroma,
+            ref_onset,
+            perf_chroma,
+            perf_onset,
+            feature_rate,
+        )
+    except Exception as exc:
+        multiscale_error = f"{type(exc).__name__}: {exc}"
+
+    legacy_result = None
+    legacy_error = ""
+    try:
+        legacy_result = _legacy_dtw_time_map(y_ref, y_perf, sample_rate)
+    except Exception as exc:
+        legacy_error = f"{type(exc).__name__}: {exc}"
+
+    if multiscale_result is None and legacy_result is None:
+        raise gr.Error(
+            "새 정렬과 기존 정렬이 모두 실패했습니다. "
+            f"multiscale={multiscale_error}; legacy={legacy_error}"
+        )
+
+    chroma_shift = 0
+    shifted_perf_chroma = perf_chroma
+    shifted_perf_onset = perf_onset
+    multiscale_quality = float("inf")
+    multiscale_spread = float("inf")
+    multi_low = multi_median = multi_high = 0.0
+    if multiscale_result is not None:
+        (
+            multiscale_ref,
+            multiscale_perf,
+            chroma_shift,
+            shifted_perf_chroma,
+            shifted_perf_onset,
+        ) = multiscale_result
+        multiscale_quality = _alignment_feature_cost(
+            ref_chroma,
+            ref_onset,
+            shifted_perf_chroma,
+            shifted_perf_onset,
+            multiscale_ref,
+            multiscale_perf,
+            feature_rate,
+        )
+        multi_low, multi_median, multi_high, multiscale_spread = _time_map_stats(
+            multiscale_ref, multiscale_perf
+        )
+
+    legacy_quality = float("inf")
+    legacy_spread = float("inf")
+    legacy_low = legacy_median = legacy_high = 0.0
+    if legacy_result is not None:
+        legacy_ref, legacy_perf = legacy_result
+        legacy_quality = _alignment_feature_cost(
+            ref_chroma,
+            ref_onset,
+            shifted_perf_chroma,
+            shifted_perf_onset,
+            legacy_ref,
+            legacy_perf,
+            feature_rate,
+        )
+        legacy_low, legacy_median, legacy_high, legacy_spread = _time_map_stats(
+            legacy_ref, legacy_perf
+        )
+
+    max_stable_spread = max(
+        12.0, min(reference_duration, performance_duration) * 0.10
+    )
+    if multiscale_result is None:
+        selected = "legacy" if legacy_spread <= max_stable_spread else "invalid"
+    elif legacy_result is None:
+        selected = "multiscale" if multiscale_spread <= max_stable_spread else "invalid"
+    else:
+        selected = _choose_alignment_method(
+            multiscale_quality,
+            legacy_quality,
+            multiscale_spread,
+            legacy_spread,
+            max_stable_spread,
+        )
+    if selected == "invalid":
+        raise gr.Error(
+            "새 정렬과 기존 정렬 모두 시간축 변동이 너무 큽니다. "
             "반복 구간을 잘못 연결할 가능성이 있어 결과 생성을 중단했습니다."
         )
+
+    disagreement_95 = 0.0
+    if multiscale_result is not None and legacy_result is not None:
+        comparison_times = np.linspace(
+            0.0,
+            min(multiscale_ref[-1], legacy_ref[-1]),
+            num=500,
+        )
+        disagreement = np.abs(
+            np.interp(comparison_times, multiscale_ref, multiscale_perf)
+            - np.interp(comparison_times, legacy_ref, legacy_perf)
+        )
+        disagreement_95 = float(np.percentile(disagreement, 95))
+    if selected == "multiscale":
+        ref_axis, perf_axis = multiscale_ref, multiscale_perf
+        offset_low, offset_mid, offset_high = multi_low, multi_median, multi_high
+    else:
+        ref_axis, perf_axis = legacy_ref, legacy_perf
+        offset_low, offset_mid, offset_high = legacy_low, legacy_median, legacy_high
+
+    diagnostics = {
+        "selected": selected,
+        "chroma_shift": chroma_shift,
+        "multiscale_quality": (
+            multiscale_quality if np.isfinite(multiscale_quality) else None
+        ),
+        "legacy_quality": legacy_quality if np.isfinite(legacy_quality) else None,
+        "multiscale_offset_spread": (
+            multiscale_spread if np.isfinite(multiscale_spread) else None
+        ),
+        "legacy_offset_spread": (
+            legacy_spread if np.isfinite(legacy_spread) else None
+        ),
+        "candidate_disagreement_95_seconds": disagreement_95,
+        "multiscale_error": multiscale_error,
+        "legacy_error": legacy_error,
+    }
+    (work_dir / "alignment_candidates.json").write_text(
+        json.dumps(diagnostics, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     status = (
-        f"DTW path frames {len(path)}, reference {ref_axis[-1]:.2f}s, "
-        f"performance {perf_axis[-1]:.2f}s, offset median {offset_mid:+.2f}s "
+        f"alignment {selected}, chroma shift {chroma_shift:+d}, "
+        f"quality multi {multiscale_quality:.3f} / legacy {legacy_quality:.3f}, "
+        f"candidate diff95 {disagreement_95:.2f}s, "
+        f"offset median {offset_mid:+.2f}s "
         f"(5-95% {offset_low:+.2f}s to {offset_high:+.2f}s)"
     )
     return ref_axis, perf_axis, status

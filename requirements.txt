@@ -6,6 +6,7 @@ soundfile==0.12.1
 --extra-index-url https://download.pytorch.org/whl/cu121
 torch==2.3.1+cu121
 torchaudio==2.3.1+cu121
-librosa==0.10.2.post1
+librosa==0.11.0
 scipy==1.13.1
+synctoolbox==1.4.2
 yt-dlp>=2025.12.8
