@@ -67,6 +67,17 @@ class AlignmentTests(unittest.TestCase):
         self.assertFalse(removed)
         self.assertEqual(unchanged, chorus_song)
 
+    def test_fuzzy_full_song_duplicate_with_joined_boundary_is_removed(self):
+        lines = [f"line {index} unique lyric content section" for index in range(30)]
+        song = "\n\n".join(lines)
+        changed_copy = song.replace("line 2 unique", "line two unique", 1)
+        duplicated = song + "\u300c" + changed_copy
+
+        cleaned, removed = app.remove_duplicate_full_lyrics(duplicated)
+
+        self.assertTrue(removed)
+        self.assertEqual(cleaned, song)
+
     def test_alignment_candidate_selection_uses_quality_and_stability(self):
         self.assertEqual(
             app._choose_alignment_method(0.20, 0.19, 2.0, 2.0, 12.0),

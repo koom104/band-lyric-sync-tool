@@ -770,16 +770,61 @@ def remove_duplicate_full_lyrics(lyrics: str) -> tuple[str, bool]:
     prefix = normalized[:prefix_length]
     search_start = int(len(normalized) * 0.40)
     search_end = int(len(normalized) * 0.60)
+    candidates: set[int] = set()
+
     candidate = normalized.find(prefix, search_start, search_end + prefix_length)
     while candidate != -1 and candidate <= search_end:
+        candidates.add(candidate)
+        candidate = normalized.find(prefix, candidate + 1, search_end + prefix_length)
+
+    # A second paste often differs by a few characters, so the complete prefix
+    # may not occur verbatim. Locate it from several shorter internal anchors.
+    anchor_length = min(48, max(24, prefix_length // 6))
+    anchor_step = max(12, anchor_length // 2)
+    for anchor_offset in range(0, prefix_length - anchor_length + 1, anchor_step):
+        anchor = prefix[anchor_offset : anchor_offset + anchor_length]
+        occurrence = normalized.find(
+            anchor,
+            search_start + anchor_offset,
+            search_end + anchor_offset + anchor_length,
+        )
+        while occurrence != -1:
+            candidate_start = occurrence - anchor_offset
+            if search_start <= candidate_start <= search_end:
+                candidates.add(candidate_start)
+            occurrence = normalized.find(
+                anchor,
+                occurrence + 1,
+                search_end + anchor_offset + anchor_length,
+            )
+
+    # Last-resort fuzzy prefix scan covers edits distributed across every anchor.
+    scan_step = max(4, prefix_length // 50)
+    for candidate_start in range(search_start, search_end + 1, scan_step):
+        window = normalized[candidate_start : candidate_start + prefix_length]
+        if len(window) >= prefix_length * 0.9:
+            prefix_score = SequenceMatcher(None, prefix, window).ratio()
+            if prefix_score >= 0.88:
+                candidates.add(candidate_start)
+
+    best: tuple[float, int] | None = None
+    for candidate in candidates:
         first_copy = normalized[:candidate]
         second_copy = normalized[candidate:]
         length_ratio = min(len(first_copy), len(second_copy)) / max(len(first_copy), len(second_copy))
         duplicate_score = SequenceMatcher(None, first_copy, second_copy).ratio()
         if length_ratio >= 0.92 and duplicate_score >= 0.97:
-            cutoff = source_positions[candidate]
-            return lyrics[:cutoff].rstrip(), True
-        candidate = normalized.find(prefix, candidate + 1, search_end + prefix_length)
+            quality = duplicate_score + 0.1 * length_ratio
+            if best is None or quality > best[0]:
+                best = (quality, candidate)
+
+    if best is not None:
+        cutoff = source_positions[best[1]]
+        while cutoff > 0 and lyrics[cutoff - 1].isspace():
+            cutoff -= 1
+        if cutoff > 0 and lyrics[cutoff - 1] in "\"'([{\u300c\u300e\u201c\u2018":
+            cutoff -= 1
+        return lyrics[:cutoff].rstrip(), True
     return lyrics, False
 
 
