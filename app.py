@@ -1690,6 +1690,55 @@ def _select_first_line_acoustic_start(
     return start
 
 
+def _candidate_source_bounds(source: str) -> tuple[int, int] | None:
+    match = re.fullmatch(r"(\d+)-(\d+)", source)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def _select_interlude_boundary_timing(
+    index: int,
+    captions: list[CaptionLine],
+    candidates: list[ForcedTimingCandidate],
+) -> tuple[float, float] | None:
+    caption = captions[index]
+    gap_before = index > 0 and caption.start - captions[index - 1].end >= 4.0
+    gap_after = index + 1 < len(captions) and captions[index + 1].start - caption.end >= 4.0
+    if not gap_before and not gap_after:
+        return None
+
+    valid = [
+        candidate
+        for candidate in candidates
+        if candidate.confidence >= 0.015
+        and candidate.collapsed_ratio < 0.70
+        and candidate.end > candidate.start + 0.35
+    ]
+    if gap_before:
+        line_number = index + 1
+        anchored = [
+            candidate
+            for candidate in valid
+            if (bounds := _candidate_source_bounds(candidate.source)) is not None
+            and bounds[0] == line_number
+        ]
+        if len(anchored) >= 2 and max(c.start for c in anchored) - min(c.start for c in anchored) <= 0.35:
+            start = float(np.median([candidate.start for candidate in anchored]))
+            end = float(np.median([candidate.end for candidate in anchored]))
+            if abs(start - caption.start) <= 3.0:
+                return start, end
+
+    if gap_after and len(valid) >= 3:
+        starts = [candidate.start for candidate in valid]
+        if max(starts) - min(starts) <= 2.0:
+            start = float(np.median(starts))
+            end = float(np.median([candidate.end for candidate in valid]))
+            if abs(start - caption.start) <= 2.5:
+                return start, end
+    return None
+
+
 @lru_cache(maxsize=2)
 def _load_forced_alignment_model(device: str):
     import stable_whisper
@@ -1785,6 +1834,16 @@ def refine_captions_with_performance_vocals(
             _select_forced_timing_consensus(caption, line_candidates)
             for caption, line_candidates in zip(captions, candidates)
         ]
+        interlude_boundaries = 0
+        for index, timing in enumerate(proposed):
+            if timing is not None:
+                continue
+            boundary_timing = _select_interlude_boundary_timing(
+                index, captions, candidates[index]
+            )
+            if boundary_timing is not None:
+                proposed[index] = boundary_timing
+                interlude_boundaries += 1
         first_line_anchor = None
         if proposed and len(captions) > 1 and proposed[0] is None:
             first_line_anchor = _select_first_line_acoustic_start(
@@ -1840,6 +1899,7 @@ def refine_captions_with_performance_vocals(
             refined,
             f"LRC-text forced-alignment consensus {accepted}/{len(captions)} lines ({device})"
             + f" / extended local correction {extended_local} lines"
+            + f" / interlude boundary correction {interlude_boundaries} lines"
             + (
                 f" / first-line acoustic anchor {first_line_anchor:.2f}s"
                 if first_line_anchor is not None

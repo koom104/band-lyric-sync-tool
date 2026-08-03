@@ -180,6 +180,33 @@ class AlignmentTests(unittest.TestCase):
             app.ForcedTimingCandidate(3.8, 4.2, 0.4, 0.2, "wide"),
         ]))
 
+    def test_interlude_boundary_corrects_both_sides_without_global_shift(self):
+        captions = [
+            app.CaptionLine(52.4, 55.3, "before"),
+            app.CaptionLine(55.4, 60.8, "edge"),
+            app.CaptionLine(73.2, 78.5, "after"),
+            app.CaptionLine(78.6, 83.9, "later"),
+        ]
+        before_candidates = [
+            app.ForcedTimingCandidate(55.35, 60.35, 0.08, 0.1, "1-2"),
+            app.ForcedTimingCandidate(56.59, 60.35, 0.08, 0.1, "2-3"),
+            app.ForcedTimingCandidate(57.18, 60.54, 0.06, 0.2, "2-4"),
+        ]
+        after_candidates = [
+            app.ForcedTimingCandidate(60.8, 79.2, 0.2, 0.3, "2-3"),
+            app.ForcedTimingCandidate(71.67, 79.2, 0.2, 0.1, "3-4"),
+            app.ForcedTimingCandidate(71.69, 79.2, 0.2, 0.1, "3-5"),
+        ]
+
+        before = app._select_interlude_boundary_timing(1, captions, before_candidates)
+        after = app._select_interlude_boundary_timing(2, captions, after_candidates)
+
+        self.assertIsNotNone(before)
+        self.assertAlmostEqual(before[0], 56.59)
+        self.assertIsNotNone(after)
+        self.assertAlmostEqual(after[0], 71.68)
+        self.assertEqual(captions[3].start, 78.6)
+
     def test_auto_language_uses_the_sync_text_script(self):
         korean = [app.LyricBlock("한국어\ntranslation", "한국어 가사입니다")]
         japanese = [app.LyricBlock("日本語", "これは日本語です")]
