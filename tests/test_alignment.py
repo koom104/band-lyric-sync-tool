@@ -123,14 +123,27 @@ class AlignmentTests(unittest.TestCase):
         self.assertIsNone(app._select_forced_timing_consensus(caption, disagreement))
         self.assertIsNone(app._select_forced_timing_consensus(caption, collapsed))
 
-    def test_forced_timing_never_overrides_dtw_by_more_than_one_second(self):
+    def test_forced_timing_rejects_large_weak_pair_correction(self):
         caption = app.CaptionLine(10.0, 14.0, "line")
         candidates = [
-            app.ForcedTimingCandidate(11.4, 15.0, 0.9, 0.0, "1-6"),
-            app.ForcedTimingCandidate(11.5, 15.1, 0.9, 0.0, "1-8"),
+            app.ForcedTimingCandidate(11.4, 15.0, 0.12, 0.0, "1-6"),
+            app.ForcedTimingCandidate(11.5, 15.1, 0.12, 0.0, "1-8"),
         ]
 
         self.assertIsNone(app._select_forced_timing_consensus(caption, candidates))
+
+    def test_forced_timing_allows_large_three_window_local_correction(self):
+        caption = app.CaptionLine(119.2, 122.8, "line")
+        candidates = [
+            app.ForcedTimingCandidate(121.66, 124.0, 0.18, 0.36, "17-24"),
+            app.ForcedTimingCandidate(121.64, 124.0, 0.16, 0.36, "19-24"),
+            app.ForcedTimingCandidate(121.63, 124.0, 0.16, 0.64, "21-28"),
+        ]
+
+        timing = app._select_forced_timing_consensus(caption, candidates)
+
+        self.assertIsNotNone(timing)
+        self.assertAlmostEqual(timing[0], 121.65, delta=0.02)
 
     def test_lrc_text_is_preserved_for_vocal_refinement(self):
         blocks = [app.LyricBlock("雨あめ\ntranslation", "雨あめ")]

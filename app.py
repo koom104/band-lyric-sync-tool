@@ -1631,7 +1631,21 @@ def _select_forced_timing_consensus(
         return None
 
     start = float(np.median([left.start, right.start]))
-    if abs(start - caption.start) > 1.0:
+    support = [
+        candidate
+        for candidate in valid
+        if abs(candidate.start - start) <= 0.45
+        and candidate.confidence >= 0.08
+        and candidate.collapsed_ratio < 0.70
+    ]
+    source_count = len({candidate.source for candidate in support})
+    strong_pair = (
+        abs(left.start - right.start) <= 0.15
+        and min(left.confidence, right.confidence) >= 0.25
+        and max(left.collapsed_ratio, right.collapsed_ratio) < 0.50
+    )
+    max_adjustment = 2.8 if source_count >= 3 or strong_pair else 1.0
+    if abs(start - caption.start) > max_adjustment:
         return None
 
     end = caption.end
@@ -1790,6 +1804,7 @@ def refine_captions_with_performance_vocals(
 
         refined: list[CaptionLine] = []
         accepted = 0
+        extended_local = 0
         for index, caption in enumerate(captions):
             start = min(duration, max(0.0, starts[index]))
             next_start = starts[index + 1] if index + 1 < len(starts) else duration
@@ -1802,6 +1817,8 @@ def refine_captions_with_performance_vocals(
             )
             if proposed[index] is not None:
                 accepted += 1
+                if abs(start - caption.start) > 1.0:
+                    extended_local += 1
             diagnostics.append(
                 {
                     "index": index + 1,
@@ -1822,6 +1839,7 @@ def refine_captions_with_performance_vocals(
         return (
             refined,
             f"LRC-text forced-alignment consensus {accepted}/{len(captions)} lines ({device})"
+            + f" / extended local correction {extended_local} lines"
             + (
                 f" / first-line acoustic anchor {first_line_anchor:.2f}s"
                 if first_line_anchor is not None
