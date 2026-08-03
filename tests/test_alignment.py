@@ -131,45 +131,41 @@ class AlignmentTests(unittest.TestCase):
         ]
 
         self.assertIsNone(app._select_forced_timing_consensus(caption, candidates))
-        self.assertIsNotNone(
-            app._select_forced_timing_consensus(
-                caption, candidates, max_start_adjustment=2.0
-            )
+
+    def test_lrc_text_is_preserved_for_vocal_refinement(self):
+        blocks = [app.LyricBlock("雨あめ\ntranslation", "雨あめ")]
+        captions, _score, _count = app.align_blocks_to_lrc(
+            blocks,
+            "[00:01.00] 雨の匂い\n[00:05.00] ",
+            8.0,
         )
 
-    def test_global_vocal_offset_uses_a_stable_multi_line_consensus(self):
-        captions = [app.CaptionLine(index * 4.0, index * 4.0 + 3.0, "line") for index in range(10)]
-        candidates = []
-        for index, caption in enumerate(captions):
-            shift = 1.45 + (index % 3 - 1) * 0.05
-            candidates.append(
-                [
-                    app.ForcedTimingCandidate(caption.start + shift, caption.end + shift, 0.2, 0.1, "short"),
-                    app.ForcedTimingCandidate(caption.start + shift + 0.04, caption.end + shift, 0.2, 0.1, "wide"),
-                ]
-            )
+        self.assertEqual(captions[0].text, "雨あめ\ntranslation")
+        self.assertEqual(captions[0].sync_text, "雨の匂い")
 
-        offset, support, mad = app._estimate_global_vocal_offset(captions, candidates)
+    def test_first_line_acoustic_anchor_does_not_shift_later_lines(self):
+        caption = app.CaptionLine(0.6, 7.6, "first")
+        candidates = [
+            app.ForcedTimingCandidate(3.82, 8.2, 0.4, 0.2, "short"),
+            app.ForcedTimingCandidate(3.86, 8.3, 0.5, 0.2, "wide"),
+        ]
 
-        self.assertAlmostEqual(offset, 1.47, delta=0.08)
-        self.assertEqual(support, 10)
-        self.assertLess(mad, 0.1)
+        start = app._select_first_line_acoustic_start(caption, 7.7, candidates)
 
-    def test_global_vocal_offset_rejects_scattered_candidates(self):
-        captions = [app.CaptionLine(index * 4.0, index * 4.0 + 3.0, "line") for index in range(10)]
-        candidates = []
-        for index, caption in enumerate(captions):
-            shift = -2.0 + index * 0.45
-            candidates.append(
-                [
-                    app.ForcedTimingCandidate(caption.start + shift, caption.end + shift, 0.2, 0.1, "short"),
-                    app.ForcedTimingCandidate(caption.start + shift + 0.02, caption.end + shift, 0.2, 0.1, "wide"),
-                ]
-            )
+        self.assertAlmostEqual(start, 3.84)
 
-        offset, _support, _mad = app._estimate_global_vocal_offset(captions, candidates)
+    def test_first_line_acoustic_anchor_rejects_weak_or_late_consensus(self):
+        caption = app.CaptionLine(0.6, 7.6, "first")
+        weak = [
+            app.ForcedTimingCandidate(3.8, 8.2, 0.1, 0.2, "short"),
+            app.ForcedTimingCandidate(3.8, 8.2, 0.1, 0.2, "wide"),
+        ]
 
-        self.assertEqual(offset, 0.0)
+        self.assertIsNone(app._select_first_line_acoustic_start(caption, 7.7, weak))
+        self.assertIsNone(app._select_first_line_acoustic_start(caption, 4.0, [
+            app.ForcedTimingCandidate(3.8, 4.2, 0.4, 0.2, "short"),
+            app.ForcedTimingCandidate(3.8, 4.2, 0.4, 0.2, "wide"),
+        ]))
 
     def test_auto_language_uses_the_sync_text_script(self):
         korean = [app.LyricBlock("한국어\ntranslation", "한국어 가사입니다")]

@@ -45,6 +45,7 @@ class CaptionLine:
     end: float
     text: str
     score: float = 1.0
+    sync_text: str = ""
 
 
 @dataclass
@@ -1151,7 +1152,7 @@ def apply_global_offset(captions: list[CaptionLine], offset_seconds: float, dura
     for caption in captions:
         start = min(max(0.0, caption.start + offset_seconds), duration)
         end = min(max(start + 0.2, caption.end + offset_seconds), duration)
-        shifted.append(CaptionLine(start, end, caption.text, caption.score))
+        shifted.append(CaptionLine(start, end, caption.text, caption.score, caption.sync_text))
     return shifted
 
 
@@ -1171,7 +1172,7 @@ def warp_captions_to_span(
         end = target_start + (caption.end - source_start) / source_span * target_span
         start = min(max(0.0, start), duration)
         end = min(max(start + 0.2, end), duration)
-        warped.append(CaptionLine(start, end, caption.text, caption.score))
+        warped.append(CaptionLine(start, end, caption.text, caption.score, caption.sync_text))
     return warped
 
 
@@ -1579,7 +1580,7 @@ def warp_captions_with_dtw(
             end = min(end, starts[idx + 1] - 0.04)
         if end <= start:
             raise gr.Error(f"DTW produced an invalid subtitle interval at block {idx + 1}.")
-        warped.append(CaptionLine(start, end, caption.text, caption.score))
+        warped.append(CaptionLine(start, end, caption.text, caption.score, caption.sync_text))
     return warped, status
 
 
@@ -1598,7 +1599,6 @@ def _forced_alignment_chunks(item_count: int) -> list[tuple[int, int]]:
 def _select_forced_timing_consensus(
     caption: CaptionLine,
     candidates: list[ForcedTimingCandidate],
-    max_start_adjustment: float = 1.0,
 ) -> tuple[float, float] | None:
     valid = [
         candidate
@@ -1631,7 +1631,7 @@ def _select_forced_timing_consensus(
         return None
 
     start = float(np.median([left.start, right.start]))
-    if abs(start - caption.start) > max_start_adjustment:
+    if abs(start - caption.start) > 1.0:
         return None
 
     end = caption.end
@@ -1645,56 +1645,35 @@ def _select_forced_timing_consensus(
     return start, end
 
 
-def _estimate_global_vocal_offset(
-    captions: list[CaptionLine],
-    candidates: list[list[ForcedTimingCandidate]],
-) -> tuple[float, int, float]:
-    deltas: list[float] = []
-    for caption, line_candidates in zip(captions, candidates):
-        valid = [
-            candidate
-            for candidate in line_candidates
-            if abs(candidate.start - caption.start) <= 4.0
-            and candidate.end > candidate.start + 0.08
-        ]
-        pairs: list[tuple[float, ForcedTimingCandidate, ForcedTimingCandidate]] = []
-        for left_index, left in enumerate(valid):
-            for right in valid[left_index + 1 :]:
-                if left.source == right.source or abs(left.start - right.start) > 0.35:
-                    continue
-                if left.collapsed_ratio >= 0.75 and right.collapsed_ratio >= 0.75:
-                    continue
-                pairs.append(
-                    (
-                        abs(left.start - right.start) + 0.15 * abs(left.end - right.end),
-                        left,
-                        right,
-                    )
-                )
-        if pairs:
-            _, left, right = min(pairs, key=lambda pair: pair[0])
-            deltas.append(float(np.median([left.start, right.start])) - caption.start)
+def _select_first_line_acoustic_start(
+    caption: CaptionLine,
+    next_start: float,
+    candidates: list[ForcedTimingCandidate],
+) -> float | None:
+    if caption.start > 1.5:
+        return None
+    pairs: list[tuple[float, ForcedTimingCandidate, ForcedTimingCandidate]] = []
+    for left_index, left in enumerate(candidates):
+        for right in candidates[left_index + 1 :]:
+            if left.source == right.source:
+                continue
+            if min(left.confidence, right.confidence) < 0.15:
+                continue
+            if max(left.collapsed_ratio, right.collapsed_ratio) >= 0.60:
+                continue
+            difference = abs(left.start - right.start)
+            if difference <= 0.35:
+                pairs.append((difference, left, right))
+    if not pairs:
+        return None
 
-    required_support = max(8, int(np.ceil(len(captions) * 0.20)))
-    if len(deltas) < required_support:
-        return 0.0, 0, float("inf")
-
-    median = float(np.median(deltas))
-    mad = float(np.median(np.abs(np.asarray(deltas) - median)))
-    inlier_radius = max(0.45, 3.0 * mad)
-    inliers = [delta for delta in deltas if abs(delta - median) <= inlier_radius]
-    same_direction = [delta for delta in inliers if delta == 0.0 or np.sign(delta) == np.sign(median)]
-    if (
-        mad > 0.35
-        or len(inliers) < required_support
-        or len(same_direction) < int(np.ceil(len(inliers) * 0.80))
-    ):
-        return 0.0, len(inliers), mad
-
-    offset = float(np.median(inliers))
-    if abs(offset) < 0.35 or abs(offset) > 3.0:
-        return 0.0, len(inliers), mad
-    return offset, len(inliers), mad
+    _, left, right = min(pairs, key=lambda pair: pair[0])
+    start = float(np.median([left.start, right.start]))
+    if start <= caption.start + 0.35 or start > caption.start + 4.0:
+        return None
+    if start >= next_start - 0.35:
+        return None
+    return start
 
 
 @lru_cache(maxsize=2)
@@ -1747,7 +1726,10 @@ def refine_captions_with_performance_vocals(
             clip = samples[
                 int(window_start * sample_rate) : int(window_end * sample_rate)
             ]
-            text = "\n".join(block.sync_text for block in blocks[start_index:end_index])
+            text = "\n".join(
+                captions[index].sync_text or blocks[index].sync_text
+                for index in range(start_index, end_index)
+            )
             result = model.align(
                 clip,
                 text,
@@ -1785,55 +1767,45 @@ def refine_captions_with_performance_vocals(
                 )
                 candidates[start_index + offset].append(candidate)
 
-        global_offset, global_support, global_mad = _estimate_global_vocal_offset(
-            captions, candidates
-        )
-        baseline_captions = [
-            CaptionLine(
-                min(duration, max(0.0, caption.start + global_offset)),
-                min(duration, max(0.0, caption.end + global_offset)),
-                caption.text,
-                caption.score,
-            )
-            for caption in captions
-        ]
         proposed = [
-            _select_forced_timing_consensus(
-                caption,
-                line_candidates,
-                max_start_adjustment=2.0 if index == 0 else 1.0,
-            )
-            for index, (caption, line_candidates) in enumerate(
-                zip(baseline_captions, candidates)
-            )
+            _select_forced_timing_consensus(caption, line_candidates)
+            for caption, line_candidates in zip(captions, candidates)
         ]
+        first_line_anchor = None
+        if proposed and len(captions) > 1 and proposed[0] is None:
+            first_line_anchor = _select_first_line_acoustic_start(
+                captions[0], captions[1].start, candidates[0]
+            )
+            if first_line_anchor is not None:
+                proposed[0] = (first_line_anchor, captions[0].end)
         starts = [
             timing[0] if timing is not None else caption.start
-            for caption, timing in zip(baseline_captions, proposed)
+            for caption, timing in zip(captions, proposed)
         ]
         for index in range(1, len(starts)):
             if starts[index] <= starts[index - 1] + 0.12:
-                starts[index] = baseline_captions[index].start
+                starts[index] = captions[index].start
             if starts[index] <= starts[index - 1] + 0.12:
                 starts[index] = starts[index - 1] + 0.12
 
         refined: list[CaptionLine] = []
         accepted = 0
-        for index, caption in enumerate(baseline_captions):
+        for index, caption in enumerate(captions):
             start = min(duration, max(0.0, starts[index]))
             next_start = starts[index + 1] if index + 1 < len(starts) else duration
             proposed_end = proposed[index][1] if proposed[index] is not None else caption.end
             end = min(duration, proposed_end, next_start - 0.05)
             if end <= start + 0.20:
                 end = min(duration, max(start + 0.20, next_start - 0.05))
-            refined.append(CaptionLine(start, end, caption.text, caption.score))
+            refined.append(
+                CaptionLine(start, end, caption.text, caption.score, caption.sync_text)
+            )
             if proposed[index] is not None:
                 accepted += 1
             diagnostics.append(
                 {
                     "index": index + 1,
-                    "dtw_start": captions[index].start,
-                    "baseline_start": caption.start,
+                    "dtw_start": caption.start,
                     "refined_start": start,
                     "accepted": proposed[index] is not None,
                     "candidates": [
@@ -1849,9 +1821,12 @@ def refine_captions_with_performance_vocals(
         )
         return (
             refined,
-            f"vocal global offset {global_offset:+.2f}s "
-            f"({global_support} lines, MAD {global_mad:.2f}s) / "
-            f"forced-alignment consensus {accepted}/{len(captions)} lines ({device})",
+            f"LRC-text forced-alignment consensus {accepted}/{len(captions)} lines ({device})"
+            + (
+                f" / first-line acoustic anchor {first_line_anchor:.2f}s"
+                if first_line_anchor is not None
+                else ""
+            ),
         )
     except Exception as exc:
         return captions, f"vocal refinement fallback to DTW: {type(exc).__name__}: {exc}"
@@ -2114,7 +2089,15 @@ def align_blocks_to_lrc(blocks: list[LyricBlock], lrc_text: str, duration: float
     for block, item in zip(blocks, timing_items):
         score = similarity(block.sync_text, item.text)
         scores.append(score)
-        captions.append(CaptionLine(item.start, min(duration, item.end), block.text, score))
+        captions.append(
+            CaptionLine(
+                item.start,
+                min(duration, item.end),
+                block.text,
+                score,
+                item.text,
+            )
+        )
     avg_score = structural_score if structural_score >= 0.22 else sum(scores) / max(1, len(scores))
     return captions, avg_score, len(lrc_items)
 
