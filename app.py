@@ -1739,6 +1739,40 @@ def _select_interlude_boundary_timing(
     return None
 
 
+def _select_contextual_pair_timing(
+    index: int,
+    caption: CaptionLine,
+    candidates: list[ForcedTimingCandidate],
+) -> tuple[float, float] | None:
+    line_number = index + 1
+    contextual = [
+        candidate
+        for candidate in candidates
+        if (bounds := _candidate_source_bounds(candidate.source)) is not None
+        and bounds[0] < line_number
+        and candidate.confidence >= 0.07
+        and candidate.collapsed_ratio < 0.70
+        and candidate.end > candidate.start + 0.35
+    ]
+    pairs: list[tuple[float, ForcedTimingCandidate, ForcedTimingCandidate]] = []
+    for left_index, left in enumerate(contextual):
+        for right in contextual[left_index + 1 :]:
+            if left.source == right.source:
+                continue
+            difference = abs(left.start - right.start)
+            if difference <= 0.60:
+                pairs.append((difference, left, right))
+    if not pairs:
+        return None
+
+    _, left, right = min(pairs, key=lambda pair: pair[0])
+    start = float(np.median([left.start, right.start]))
+    if not 1.0 < abs(start - caption.start) <= 2.5:
+        return None
+    end = float(np.median([left.end, right.end]))
+    return start, end
+
+
 @lru_cache(maxsize=2)
 def _load_forced_alignment_model(device: str):
     import stable_whisper
@@ -1844,6 +1878,16 @@ def refine_captions_with_performance_vocals(
             if boundary_timing is not None:
                 proposed[index] = boundary_timing
                 interlude_boundaries += 1
+        contextual_corrections = 0
+        for index, timing in enumerate(proposed):
+            if timing is not None:
+                continue
+            contextual_timing = _select_contextual_pair_timing(
+                index, captions[index], candidates[index]
+            )
+            if contextual_timing is not None:
+                proposed[index] = contextual_timing
+                contextual_corrections += 1
         first_line_anchor = None
         if proposed and len(captions) > 1 and proposed[0] is None:
             first_line_anchor = _select_first_line_acoustic_start(
@@ -1900,6 +1944,7 @@ def refine_captions_with_performance_vocals(
             f"LRC-text forced-alignment consensus {accepted}/{len(captions)} lines ({device})"
             + f" / extended local correction {extended_local} lines"
             + f" / interlude boundary correction {interlude_boundaries} lines"
+            + f" / contextual correction {contextual_corrections} lines"
             + (
                 f" / first-line acoustic anchor {first_line_anchor:.2f}s"
                 if first_line_anchor is not None

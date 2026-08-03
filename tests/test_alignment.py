@@ -207,6 +207,29 @@ class AlignmentTests(unittest.TestCase):
         self.assertAlmostEqual(after[0], 71.68)
         self.assertEqual(captions[3].start, 78.6)
 
+    def test_contextual_pair_ignores_current_line_outlier(self):
+        caption = app.CaptionLine(108.94, 111.68, "line")
+        candidates = [
+            app.ForcedTimingCandidate(110.09, 112.81, 0.086, 0.2, "13-20"),
+            app.ForcedTimingCandidate(110.62, 112.76, 0.092, 0.1, "17-24"),
+            app.ForcedTimingCandidate(107.44, 112.81, 0.074, 0.1, "19-24"),
+        ]
+
+        timing = app._select_contextual_pair_timing(18, caption, candidates)
+
+        self.assertIsNotNone(timing)
+        self.assertAlmostEqual(timing[0], 110.355)
+
+    def test_contextual_pair_requires_prior_context_and_moderate_confidence(self):
+        caption = app.CaptionLine(108.94, 111.68, "line")
+        candidates = [
+            app.ForcedTimingCandidate(110.1, 112.8, 0.05, 0.1, "13-20"),
+            app.ForcedTimingCandidate(110.2, 112.8, 0.05, 0.1, "17-24"),
+            app.ForcedTimingCandidate(110.2, 112.8, 0.5, 0.1, "19-24"),
+        ]
+
+        self.assertIsNone(app._select_contextual_pair_timing(18, caption, candidates))
+
     def test_auto_language_uses_the_sync_text_script(self):
         korean = [app.LyricBlock("한국어\ntranslation", "한국어 가사입니다")]
         japanese = [app.LyricBlock("日本語", "これは日本語です")]
