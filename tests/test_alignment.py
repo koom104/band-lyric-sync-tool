@@ -131,6 +131,45 @@ class AlignmentTests(unittest.TestCase):
         ]
 
         self.assertIsNone(app._select_forced_timing_consensus(caption, candidates))
+        self.assertIsNotNone(
+            app._select_forced_timing_consensus(
+                caption, candidates, max_start_adjustment=2.0
+            )
+        )
+
+    def test_global_vocal_offset_uses_a_stable_multi_line_consensus(self):
+        captions = [app.CaptionLine(index * 4.0, index * 4.0 + 3.0, "line") for index in range(10)]
+        candidates = []
+        for index, caption in enumerate(captions):
+            shift = 1.45 + (index % 3 - 1) * 0.05
+            candidates.append(
+                [
+                    app.ForcedTimingCandidate(caption.start + shift, caption.end + shift, 0.2, 0.1, "short"),
+                    app.ForcedTimingCandidate(caption.start + shift + 0.04, caption.end + shift, 0.2, 0.1, "wide"),
+                ]
+            )
+
+        offset, support, mad = app._estimate_global_vocal_offset(captions, candidates)
+
+        self.assertAlmostEqual(offset, 1.47, delta=0.08)
+        self.assertEqual(support, 10)
+        self.assertLess(mad, 0.1)
+
+    def test_global_vocal_offset_rejects_scattered_candidates(self):
+        captions = [app.CaptionLine(index * 4.0, index * 4.0 + 3.0, "line") for index in range(10)]
+        candidates = []
+        for index, caption in enumerate(captions):
+            shift = -2.0 + index * 0.45
+            candidates.append(
+                [
+                    app.ForcedTimingCandidate(caption.start + shift, caption.end + shift, 0.2, 0.1, "short"),
+                    app.ForcedTimingCandidate(caption.start + shift + 0.02, caption.end + shift, 0.2, 0.1, "wide"),
+                ]
+            )
+
+        offset, _support, _mad = app._estimate_global_vocal_offset(captions, candidates)
+
+        self.assertEqual(offset, 0.0)
 
     def test_auto_language_uses_the_sync_text_script(self):
         korean = [app.LyricBlock("한국어\ntranslation", "한국어 가사입니다")]

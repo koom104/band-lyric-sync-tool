@@ -1598,6 +1598,7 @@ def _forced_alignment_chunks(item_count: int) -> list[tuple[int, int]]:
 def _select_forced_timing_consensus(
     caption: CaptionLine,
     candidates: list[ForcedTimingCandidate],
+    max_start_adjustment: float = 1.0,
 ) -> tuple[float, float] | None:
     valid = [
         candidate
@@ -1630,7 +1631,7 @@ def _select_forced_timing_consensus(
         return None
 
     start = float(np.median([left.start, right.start]))
-    if abs(start - caption.start) > 1.0:
+    if abs(start - caption.start) > max_start_adjustment:
         return None
 
     end = caption.end
@@ -1642,6 +1643,58 @@ def _select_forced_timing_consensus(
         if abs(proposed_end - caption.end) <= 3.0:
             end = proposed_end
     return start, end
+
+
+def _estimate_global_vocal_offset(
+    captions: list[CaptionLine],
+    candidates: list[list[ForcedTimingCandidate]],
+) -> tuple[float, int, float]:
+    deltas: list[float] = []
+    for caption, line_candidates in zip(captions, candidates):
+        valid = [
+            candidate
+            for candidate in line_candidates
+            if abs(candidate.start - caption.start) <= 4.0
+            and candidate.end > candidate.start + 0.08
+        ]
+        pairs: list[tuple[float, ForcedTimingCandidate, ForcedTimingCandidate]] = []
+        for left_index, left in enumerate(valid):
+            for right in valid[left_index + 1 :]:
+                if left.source == right.source or abs(left.start - right.start) > 0.35:
+                    continue
+                if left.collapsed_ratio >= 0.75 and right.collapsed_ratio >= 0.75:
+                    continue
+                pairs.append(
+                    (
+                        abs(left.start - right.start) + 0.15 * abs(left.end - right.end),
+                        left,
+                        right,
+                    )
+                )
+        if pairs:
+            _, left, right = min(pairs, key=lambda pair: pair[0])
+            deltas.append(float(np.median([left.start, right.start])) - caption.start)
+
+    required_support = max(8, int(np.ceil(len(captions) * 0.20)))
+    if len(deltas) < required_support:
+        return 0.0, 0, float("inf")
+
+    median = float(np.median(deltas))
+    mad = float(np.median(np.abs(np.asarray(deltas) - median)))
+    inlier_radius = max(0.45, 3.0 * mad)
+    inliers = [delta for delta in deltas if abs(delta - median) <= inlier_radius]
+    same_direction = [delta for delta in inliers if delta == 0.0 or np.sign(delta) == np.sign(median)]
+    if (
+        mad > 0.35
+        or len(inliers) < required_support
+        or len(same_direction) < int(np.ceil(len(inliers) * 0.80))
+    ):
+        return 0.0, len(inliers), mad
+
+    offset = float(np.median(inliers))
+    if abs(offset) < 0.35 or abs(offset) > 3.0:
+        return 0.0, len(inliers), mad
+    return offset, len(inliers), mad
 
 
 @lru_cache(maxsize=2)
@@ -1732,23 +1785,41 @@ def refine_captions_with_performance_vocals(
                 )
                 candidates[start_index + offset].append(candidate)
 
+        global_offset, global_support, global_mad = _estimate_global_vocal_offset(
+            captions, candidates
+        )
+        baseline_captions = [
+            CaptionLine(
+                min(duration, max(0.0, caption.start + global_offset)),
+                min(duration, max(0.0, caption.end + global_offset)),
+                caption.text,
+                caption.score,
+            )
+            for caption in captions
+        ]
         proposed = [
-            _select_forced_timing_consensus(caption, line_candidates)
-            for caption, line_candidates in zip(captions, candidates)
+            _select_forced_timing_consensus(
+                caption,
+                line_candidates,
+                max_start_adjustment=2.0 if index == 0 else 1.0,
+            )
+            for index, (caption, line_candidates) in enumerate(
+                zip(baseline_captions, candidates)
+            )
         ]
         starts = [
             timing[0] if timing is not None else caption.start
-            for caption, timing in zip(captions, proposed)
+            for caption, timing in zip(baseline_captions, proposed)
         ]
         for index in range(1, len(starts)):
             if starts[index] <= starts[index - 1] + 0.12:
-                starts[index] = captions[index].start
+                starts[index] = baseline_captions[index].start
             if starts[index] <= starts[index - 1] + 0.12:
                 starts[index] = starts[index - 1] + 0.12
 
         refined: list[CaptionLine] = []
         accepted = 0
-        for index, caption in enumerate(captions):
+        for index, caption in enumerate(baseline_captions):
             start = min(duration, max(0.0, starts[index]))
             next_start = starts[index + 1] if index + 1 < len(starts) else duration
             proposed_end = proposed[index][1] if proposed[index] is not None else caption.end
@@ -1761,7 +1832,8 @@ def refine_captions_with_performance_vocals(
             diagnostics.append(
                 {
                     "index": index + 1,
-                    "dtw_start": caption.start,
+                    "dtw_start": captions[index].start,
+                    "baseline_start": caption.start,
                     "refined_start": start,
                     "accepted": proposed[index] is not None,
                     "candidates": [
@@ -1777,7 +1849,9 @@ def refine_captions_with_performance_vocals(
         )
         return (
             refined,
-            f"vocal forced-alignment consensus {accepted}/{len(captions)} lines ({device})",
+            f"vocal global offset {global_offset:+.2f}s "
+            f"({global_support} lines, MAD {global_mad:.2f}s) / "
+            f"forced-alignment consensus {accepted}/{len(captions)} lines ({device})",
         )
     except Exception as exc:
         return captions, f"vocal refinement fallback to DTW: {type(exc).__name__}: {exc}"
