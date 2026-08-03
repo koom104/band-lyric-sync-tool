@@ -60,6 +60,7 @@ def main() -> None:
     os.environ["TORCH_HOME"] = str(cache_root / "torch")
     os.environ["HF_HOME"] = str(cache_root / "huggingface")
     os.environ["XDG_CACHE_HOME"] = str(cache_root)
+    os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
     os.environ["PATH"] = (
         str(distribution_root / "bin")
         + os.pathsep
@@ -96,6 +97,7 @@ def main() -> None:
             server_port=port,
             inbrowser=open_browser,
             show_error=True,
+            allowed_paths=[str(data_root)],
         )
     except Exception as exc:
         print(f"Startup failed: {type(exc).__name__}: {exc}")

@@ -55,6 +55,19 @@ if (-not $SkipDependencies) {
     if ($LASTEXITCODE -ne 0) {
         throw "Dependency installation failed."
     }
+
+    # PySoundFile is a legacy Sync Toolbox dependency that installs the same
+    # soundfile.py module. Reinstall the pinned modern package last.
+    & $DevPython -m pip install `
+        --disable-pip-version-check `
+        --upgrade `
+        --force-reinstall `
+        --no-deps `
+        --target $SitePackages `
+        "soundfile==0.12.1"
+    if ($LASTEXITCODE -ne 0) {
+        throw "SoundFile compatibility repair failed."
+    }
 }
 
 foreach ($PrefixDirectory in @("Library", "share")) {
@@ -135,7 +148,7 @@ GPU:
 
 $env:PATH = (Join-Path $PortableRoot "bin") + [IO.Path]::PathSeparator + $env:PATH
 $env:BAND_LYRIC_SYNC_DATA_DIR = Join-Path $BuildRoot "validation-data"
-& (Join-Path $RuntimeRoot "python.exe") -c "import gradio, torch, demucs, stable_whisper, synctoolbox; print('runtime-ok', torch.__version__, torch.cuda.is_available())"
+& (Join-Path $RuntimeRoot "python.exe") -c "import gradio, torch, demucs, stable_whisper, synctoolbox, soundfile; assert hasattr(soundfile, 'SoundFileRuntimeError'); print('runtime-ok', torch.__version__, torch.cuda.is_available(), soundfile.__version__)"
 if ($LASTEXITCODE -ne 0) {
     throw "Portable runtime import validation failed."
 }
@@ -178,8 +191,8 @@ if (-not $SkipInstaller) {
 }
 
 $Artifacts = Get-ChildItem -LiteralPath $ReleaseRoot -File | Where-Object {
-    $_.Name -like "BandLyricSync-Setup-*-win64.exe" -or
-    $_.Name -like "BandLyricSync-*-portable-win64.zip"
+    $_.Name -eq "BandLyricSync-Setup-$Version-win64.exe" -or
+    $_.Name -eq "BandLyricSync-$Version-portable-win64.zip"
 } | ForEach-Object {
     [PSCustomObject]@{
         Name = $_.Name

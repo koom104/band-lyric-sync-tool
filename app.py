@@ -19,6 +19,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Iterable
 
+os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
+
 import gradio as gr
 import numpy as np
 
@@ -2582,4 +2584,5 @@ if __name__ == "__main__":
         server_port=int(os.environ.get("BAND_LYRIC_SYNC_PORT", "7860")),
         inbrowser=os.environ.get("BAND_LYRIC_SYNC_OPEN_BROWSER", "1") != "0",
         show_error=True,
+        allowed_paths=[str(DATA_ROOT)],
     )
